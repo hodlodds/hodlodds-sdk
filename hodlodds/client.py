@@ -14,7 +14,9 @@ no higher than your limit. A payment is never retried automatically. The key fil
 only the SDK-signed USDC transfer authorization leaves the machine.
 """
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -22,7 +24,7 @@ import sys
 from decimal import Decimal, DecimalException
 from importlib.metadata import version
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 SDK_VERSION = "2.25.0"
 NETWORKS = {
@@ -36,6 +38,11 @@ NETWORKS = {
 ADDRESS = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
 USDC_ATOMIC = Decimal(10) ** 6
 HARD_MAX_USDC = Decimal("1")
+BOARD_MAX_USDC = Decimal("2.5")
+BOARD_ATOMIC_PER_COIN = 5000
+BOARD_SORTS = ("safest", "riskiest", "liquidity", "newest", "active")
+BOARD_FILTERS = ("max_risk", "min_risk", "min_liquidity_sol", "min_age_min", "max_age_min",
+                 "min_trades_5", "min_confidence")
 BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MAX_PAYMENT_HEADER = 16384
 MAX_SIGNATURE_HEADER = 65536
@@ -63,14 +70,14 @@ class Answer:
         return "Answer(status=%r, paid=%r)" % (self.status, self.paid)
 
 
-def _usdc(value, name):
-    message = name + " must be above 0, at most 1 USDC, with at most 6 decimals"
+def _usdc(value, name, maximum=HARD_MAX_USDC):
+    message = name + " must be above 0, at most %s USDC, with at most 6 decimals" % maximum
     try:
         text = str(value)
         if len(text) > 128:
             raise ValueError()
         amount = Decimal(text)
-        if not amount.is_finite() or not 0 < amount <= HARD_MAX_USDC:
+        if not amount.is_finite() or not 0 < amount <= maximum:
             raise ValueError()
         # local (2026-10-17, Codex r54): Decimal multiplication can round away
         # fractional atoms. Work on the exact coefficient/exponent instead.
@@ -83,12 +90,51 @@ def _usdc(value, name):
             atomic = coefficient // (10 ** -power)
         else:
             atomic = coefficient * 10 ** power
-        if not 0 < atomic <= 1000000:
+        if not 0 < atomic <= int(maximum * USDC_ATOMIC):
             raise ValueError()
         return atomic
     except (DecimalException, ValueError, TypeError, OverflowError):
         pass
     raise HodlOddsError(message)
+
+
+def _board_query(limit, sort, filters):
+    # local (2026-10-17, Codex r59): validate before HTTP/key access and send a
+    # canonical query; the returned offer must describe this same selection.
+    if type(limit) is not int or not 10 <= limit <= 500:
+        raise HodlOddsError("limit must be an integer between 10 and 500")
+    if sort not in BOARD_SORTS:
+        raise HodlOddsError("sort must be one of: " + ", ".join(BOARD_SORTS))
+    unknown = set(filters) - set(BOARD_FILTERS)
+    if unknown:
+        raise HodlOddsError("unknown board filter: " + ", ".join(sorted(unknown)))
+    normalized = {}
+    for name in BOARD_FILTERS:
+        if name not in filters:
+            continue
+        value = filters[name]
+        if name == "min_confidence":
+            if value not in ("high", "medium", "low"):
+                raise HodlOddsError("min_confidence must be high, medium or low")
+        elif name == "min_trades_5":
+            if type(value) is not int or value < 0:
+                raise HodlOddsError("min_trades_5 must be a nonnegative integer")
+        else:
+            try:
+                if isinstance(value, bool) or value is None:
+                    raise ValueError()
+                value = float(value)
+                if not math.isfinite(value) or value < 0 or (name in ("min_risk", "max_risk") and value > 1):
+                    raise ValueError()
+                value = 0.0 if value == 0 else value
+            except (ValueError, TypeError, OverflowError):
+                raise HodlOddsError(name + " must be a finite number " +
+                                    ("between 0 and 1" if name in ("min_risk", "max_risk") else "at least 0")) from None
+        normalized[name] = value
+    for lo, hi in (("min_risk", "max_risk"), ("min_age_min", "max_age_min")):
+        if lo in normalized and hi in normalized and normalized[lo] > normalized[hi]:
+            raise HodlOddsError(lo + " must not exceed " + hi)
+    return {"limit": limit, "sort": sort, "filters": normalized}
 
 
 def _base58_size(value):
@@ -214,8 +260,15 @@ class HodlOdds:
         """Last-known odds (<= 30 min old, labelled stale, confidence downgraded); 0.002 USDC."""
         return self._paid("/v1/risk/" + self._mint(mint) + "/last", max_price_usdc)
 
-    def board(self, max_price_usdc=None):
-        return self._paid("/v1/board", max_price_usdc)
+    def board(self, limit=50, sort="safest", max_price_usdc=None, **filters):
+        """Current covered SOL ranking; 0.005 USDC per delivered coin, at most 500.
+
+        Pass a per-call maximum covering the dynamic total (e.g. 0.5 for 100
+        coins). An empty match set is free. No pagination or automatic retries.
+        """
+        query = _board_query(limit, sort, filters)
+        params = {"limit": query["limit"], "sort": query["sort"], **query["filters"]}
+        return self._paid("/v1/board?" + urlencode(params), max_price_usdc, board_query=query)
 
     def close(self):
         try:
@@ -312,7 +365,7 @@ class HodlOdds:
                 raise HodlOddsError("cannot initialize payment SDK; no authorization was sent") from None
         return self._sdk
 
-    def _check_offer(self, data, limit):
+    def _check_offer(self, data, limit, board_query=None):
         if not isinstance(data, dict) or type(data.get("x402Version")) is not int or data.get("x402Version") != 2:
             raise HodlOddsError("only x402 v2 offers are accepted")
         accepts = data.get("accepts")
@@ -342,10 +395,30 @@ class HodlOdds:
             raise HodlOddsError("invalid or oversized payment memo")
         if "recentBlockhash" in extra and not _address(extra["recentBlockhash"]):
             raise HodlOddsError("invalid payment blockhash")
+        if board_query is not None:
+            board = extra.get("hodloddsBoard")
+            if (not isinstance(board, dict) or type(board.get("version")) is not int or board["version"] != 1
+                    or set(board) != {"version", "query", "priced_n", "nonce"}
+                    or json.dumps(board.get("query"), sort_keys=True, allow_nan=False)
+                    != json.dumps(board_query, sort_keys=True, allow_nan=False)
+                    or type(board.get("priced_n")) is not int
+                    or not 1 <= board["priced_n"] <= board_query["limit"]
+                    or not isinstance(board.get("nonce"), str) or not re.fullmatch("[0-9a-f]{32}", board["nonce"])
+                    or int(amount) != board["priced_n"] * BOARD_ATOMIC_PER_COIN):
+                raise HodlOddsError("board offer does not match the requested query and per-coin price")
+            binding_signature = extra.get("hodloddsBoardSignature")
+            if not isinstance(binding_signature, str) or not re.fullmatch("[0-9a-f]{64}", binding_signature):
+                raise HodlOddsError("board offer is missing its server binding signature")
+            # 32 hex chars: the SPL Memo instruction must fit the SDK's 20,000 CU limit.
+            expected_memo = hashlib.sha256(b"hodlodds.board.v1\0" + json.dumps(
+                board, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()[:32]
+            if extra.get("memo") != expected_memo:
+                raise HodlOddsError("board payment memo does not bind the requested query and count")
         return int(amount)
 
-    def _paid(self, path, max_price_usdc):
-        limit = self.max_atomic if max_price_usdc is None else _usdc(max_price_usdc, "max_price_usdc")
+    def _paid(self, path, max_price_usdc, board_query=None):
+        maximum = BOARD_MAX_USDC if board_query is not None else HARD_MAX_USDC
+        limit = self.max_atomic if max_price_usdc is None else _usdc(max_price_usdc, "max_price_usdc", maximum)
         url = self.base + path
         first = self._request(url)
         if first.status_code == 200:
@@ -360,7 +433,7 @@ class HodlOdds:
         try:
             parsed = protocol["decode"](header)
             offer = parsed.model_dump(by_alias=True, exclude_none=True)
-            amount = self._check_offer(offer, limit)
+            amount = self._check_offer(offer, limit, board_query)
         except HodlOddsError:
             raise
         except Exception:
@@ -372,7 +445,14 @@ class HodlOdds:
         if offer["accepts"][0]["extra"]["feePayer"] == sdk["payer"]:
             raise HodlOddsError("payer must differ from the facilitator fee payer")
         try:
-            payload = sdk["client"].create_payment_payload(parsed)
+            # local (2026-10-17, Codex r59): SDK 2.25.0 itself defaults to $1.
+            # Permit only this already-validated total; do not disable controls
+            # or leave a board's larger allowance on the cached SDK instance.
+            sdk["client"].set_spend_controls({"max_amount_per_payment": "$" + _fmt(str(amount))})
+            try:
+                payload = sdk["client"].create_payment_payload(parsed)
+            finally:
+                sdk["client"].set_spend_controls({"max_amount_per_payment": "$1"})
             signature = protocol["encode"](payload)
             if (not isinstance(signature, str) or not signature or len(signature) > MAX_SIGNATURE_HEADER
                     or not signature.isascii() or any(c.isspace() for c in signature)):
@@ -445,8 +525,18 @@ def main(argv=None):
     p.add_argument("--network", default=os.environ.get("HODLODDS_NETWORK", "devnet"), choices=sorted(NETWORKS))
     p.add_argument("--keypair", default=os.environ.get("HODLODDS_KEYPAIR"))
     p.add_argument("--pay-to", default=os.environ.get("HODLODDS_PAY_TO"))
-    p.add_argument("--max-price", default=os.environ.get("HODLODDS_MAX_PRICE", "0.01"), help="USDC, default 0.01")
+    p.add_argument("--max-price", default=os.environ.get("HODLODDS_MAX_PRICE", "0.01"),
+                   help="USDC spending limit (default 0.01; hard cap 2.5 for board, 1 otherwise)")
     p.add_argument("--rpc-url")
+    p.add_argument("--limit", type=int, default=50, help="board coins requested, 10..500 (default 50)")
+    p.add_argument("--sort", default="safest", choices=BOARD_SORTS)
+    p.add_argument("--max-risk")
+    p.add_argument("--min-risk")
+    p.add_argument("--min-liquidity", dest="min_liquidity_sol")
+    p.add_argument("--min-age", dest="min_age_min")
+    p.add_argument("--max-age", dest="max_age_min")
+    p.add_argument("--min-trades", dest="min_trades_5", type=int)
+    p.add_argument("--min-confidence", choices=("high", "medium", "low"))
     args = list(sys.argv[1:] if argv is None else argv)
     a = p.parse_args(args)
     if a.command in ("risk", "last") and not a.mint:
@@ -454,15 +544,23 @@ def main(argv=None):
     if a.command not in ("risk", "last") and a.mint:
         p.error(a.command + " does not take a mint")
     explicit = lambda flag: any(v == flag or v.startswith(flag + "=") for v in args)
+    board_flags = ("--limit", "--sort", "--max-risk", "--min-risk", "--min-liquidity", "--min-age",
+                   "--max-age", "--min-trades", "--min-confidence")
+    if a.command != "board" and any(explicit(flag) for flag in board_flags):
+        p.error("board filters and sorting can be used only with board")
     if a.network == "mainnet" and not (explicit("--network") and explicit("--pay-to")):
         p.error("mainnet requires explicit --network mainnet and --pay-to; environment defaults are not enough")
     try:
         with HodlOdds(a.base_url, keypair=a.keypair, network=a.network, pay_to=a.pay_to,
-                      max_price_usdc=a.max_price, rpc_url=a.rpc_url) as client:
+                      max_price_usdc="0.01" if a.command == "board" else a.max_price, rpc_url=a.rpc_url) as client:
             if a.command in ("status", "meta"):
                 print(json.dumps(getattr(client, a.command)(), indent=2))
                 return 0
-            answer = getattr(client, a.command)(*([a.mint] if a.mint and a.command != "board" else []))
+            if a.command == "board":
+                filters = {name: getattr(a, name) for name in BOARD_FILTERS if getattr(a, name) is not None}
+                answer = client.board(limit=a.limit, sort=a.sort, max_price_usdc=a.max_price, **filters)
+            else:
+                answer = getattr(client, a.command)(a.mint)
             print(json.dumps(answer.data, indent=2))
             if answer.payment:
                 print("\nPaid %(amount_usdc)s USDC on %(network)s from %(payer)s\nTransaction: %(explorer)s" % answer.payment)

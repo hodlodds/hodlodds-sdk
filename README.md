@@ -22,7 +22,7 @@ how well past predictions in that probability range matched reality.
 | `GET /v1/status` | free | Feed state (`live` / `stale` / `down`), age, incidents, uptime |
 | `GET /v1/meta` | free | Definition, prices, payment details, model card |
 | `GET /v1/risk/{mint}` | $0.01 | Fresh odds for one token |
-| `GET /v1/board` | $0.05 | Ranked board of covered tokens |
+| `GET /v1/board?limit=N` | $0.005 per coin delivered | Ranked, filtered board of 10–500 covered tokens; pay only for coins returned, empty is free |
 | `GET /v1/risk/{mint}/last` | $0.002 | Last known odds during a feed interruption, at most 30 minutes old, labelled stale, confidence lowered one level |
 
 You only pay for fresh, covered answers. "Not covered", "feed interrupted" and
@@ -43,7 +43,8 @@ Command line:
 ```sh
 hodlodds status
 hodlodds risk <MINT> --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIENT> --network devnet
-hodlodds board --max-price 0.05 --keypair ... --pay-to ... --network devnet
+hodlodds board --limit 100 --sort safest --max-risk 0.05 --min-liquidity 50 --max-price 0.5 \
+  --keypair ... --pay-to ... --network devnet
 ```
 
 Python:
@@ -65,6 +66,18 @@ with HodlOdds("https://api.hodlodds.com", keypair="~/.config/hodlodds/wallet.jso
 `<RECIPIENT>` is the payment address published in `GET /v1/meta` (and in this
 README at launch). Pin it in your code: the client refuses any offer that pays
 someone else.
+
+Board options: `limit` 10–500 (default 50); `sort` = `safest` (default), `riskiest`,
+`liquidity`, `newest`, `active`; filters `max_risk`, `min_risk`, `min_liquidity_sol`,
+`min_age_min`, `max_age_min`, `min_trades_5`, `min_confidence` (`high`/`medium`/`low`).
+The total price is `0.005 × coins returned`; pass a `max_price` at least that high
+(the client caps a single board payment at 2.5 USDC).
+
+```python
+board = client.board(limit=100, sort="safest", max_risk=0.05, min_liquidity_sol=50, max_price_usdc="0.5")
+for row in board.data["rows"]:
+    print(row["mint"], row["p_crash_60m"], row["confidence"]["level"])
+```
 
 Environment variables for the CLI: `HODLODDS_BASE_URL`, `HODLODDS_NETWORK`,
 `HODLODDS_KEYPAIR`, `HODLODDS_PAY_TO`, `HODLODDS_MAX_PRICE`.

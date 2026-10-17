@@ -5,6 +5,7 @@ The optional real-SDK test mocks every RPC used for transaction construction.
 """
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -13,6 +14,7 @@ from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 import unittest
 from unittest.mock import patch
 
@@ -37,6 +39,20 @@ def settlement():
             "payer": PAYER, "amount": "10000"}
 
 
+def board_offer(sdk, n=10, limit=50, sort="safest", **filters):
+    sdk.offer["accepts"][0]["amount"] = str(n * client.BOARD_ATOMIC_PER_COIN)
+    sdk.offer["accepts"][0]["extra"]["hodloddsBoard"] = {
+        "version": 1, "query": client._board_query(limit, sort, filters), "priced_n": n, "nonce": "a" * 32}
+    sdk.offer["accepts"][0]["extra"]["hodloddsBoardSignature"] = "b" * 64  # Server-HMAC shape; verified by server, not client.
+    sdk.offer["accepts"][0]["extra"]["memo"] = board_memo(sdk.offer["accepts"][0]["extra"]["hodloddsBoard"])
+    sdk.receipt["amount"] = sdk.offer["accepts"][0]["amount"]
+
+
+def board_memo(metadata):
+    return hashlib.sha256(b"hodlodds.board.v1\0" + json.dumps(
+        metadata, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()[:32]
+
+
 class Decoded:
     def __init__(self, data):
         self.data = data
@@ -49,6 +65,7 @@ class FakeSDK:
     def __init__(self):
         self.offer, self.receipt = offer(), settlement()
         self.signs, self.loads = 0, 0
+        self.spend_caps = []
         self.payer = PAYER
         self.decode_error = self.receipt_error = self.sign_error = None
         self.encoded = "TEST_AUTHORIZATION_DO_NOT_LOG"
@@ -75,6 +92,9 @@ class FakeSDK:
         if self.sign_error:
             raise self.sign_error
         return {"authorization": "fixture"}
+
+    def set_spend_controls(self, controls):
+        self.spend_caps.append(controls["max_amount_per_payment"])
 
 
 class Headers:
@@ -285,10 +305,99 @@ class ClientTests(unittest.TestCase):
         c = self.make(); self.sdk.offer["accepts"][0]["amount"] = "2000"; self.sdk.receipt["amount"] = "2000"
         self.assertEqual(c.last(MINT).payment["amount_usdc"], "0.002")
         self.assertTrue(self.http.calls[0][1].endswith("/last"))
-        c = self.make(); self.sdk.offer["accepts"][0]["amount"] = "50000"; self.sdk.receipt["amount"] = "50000"
+        c = self.make(); board_offer(self.sdk)
         self.assertEqual(c.board(max_price_usdc="0.05").payment["amount_usdc"], "0.05")
         c = self.make(); self.assert_no_payment(lambda: c.risk(MINT, max_price_usdc="0.0000001"))
         self.assertEqual(len(self.http.calls), 0)
+
+    def test_board_normalizes_every_filter_and_sends_one_identical_paid_retry(self):
+        filters = {"max_risk": "0.20", "min_risk": 0.01, "min_liquidity_sol": 100,
+                   "min_age_min": 60, "max_age_min": 1440, "min_trades_5": 5, "min_confidence": "medium"}
+        c = self.make(); board_offer(self.sdk, n=37, limit=100, sort="liquidity", **filters)
+        answer = c.board(limit=100, sort="liquidity", max_price_usdc="0.5", **filters)
+        self.assertEqual(answer.payment["amount_usdc"], "0.185")
+        self.assertEqual(self.http.calls[0][1], self.http.calls[1][1])
+        query = parse_qs(urlparse(self.http.calls[0][1]).query)
+        self.assertEqual(query, {"limit": ["100"], "sort": ["liquidity"], "max_risk": ["0.2"],
+            "min_risk": ["0.01"], "min_liquidity_sol": ["100.0"], "min_age_min": ["60.0"],
+            "max_age_min": ["1440.0"], "min_trades_5": ["5"], "min_confidence": ["medium"]})
+        self.assertEqual(self.sdk.signs, 1)
+
+    def test_board_sort_and_filter_validation_precedes_http_and_key_access(self):
+        bad = [{"limit": v} for v in (9, 501, True, 10.0, "50", None)]
+        bad += [{"sort": v} for v in ("lowest", "highest", None, [])]
+        bad += [{name: value} for name, value in (("page", 1), ("cursor", "anything"), ("n", 50),
+            ("min_risk", -0.01), ("max_risk", 1.01), ("max_risk", "NaN"), ("min_age_min", -1),
+            ("max_age_min", float("inf")), ("min_liquidity_sol", True), ("min_liquidity_sol", None),
+            ("min_trades_5", 1.5), ("min_trades_5", -1), ("min_trades_5", True),
+            ("min_confidence", "experimental"), ("min_confidence", None))]
+        bad += [{"min_risk": 0.5, "max_risk": 0.2}, {"min_age_min": 120, "max_age_min": 60}]
+        for kwargs in bad:
+            with self.subTest(kwargs=kwargs):
+                c = self.make()
+                self.assert_no_payment(lambda: c.board(**kwargs))
+                self.assertEqual(self.http.calls, [])
+                self.assertEqual(self.sdk.loads, 0)
+        for sort in client.BOARD_SORTS:
+            c = self.make([Response(200, body={"rows": []})])
+            self.assertFalse(c.board(limit=10, sort=sort, max_risk=1, min_risk=0, min_age_min=0,
+                                     min_liquidity_sol=0, max_age_min=0, min_trades_5=0,
+                                     min_confidence="low").paid)
+
+    def test_board_dynamic_max_price_and_board_only_cap(self):
+        c = self.make(); board_offer(self.sdk, n=37, limit=100)
+        self.assert_no_payment(lambda: c.board(limit=100, max_price_usdc="0.184999"))
+        self.assertEqual(self.sdk.loads, 0)
+        c = self.make(); board_offer(self.sdk, n=37, limit=100)
+        self.assertEqual(c.board(limit=100, max_price_usdc=".185").payment["amount_usdc"], "0.185")
+        c = self.make(); board_offer(self.sdk, n=500, limit=500)
+        self.assertEqual(c.board(limit=500, max_price_usdc="2.500000").payment["amount_usdc"], "2.5")
+        self.assertEqual(self.sdk.spend_caps, ["$2.5", "$1"])
+        for cap in ("2.500001", "0.0000001", "NaN"):
+            c = self.make(); board_offer(self.sdk)
+            self.assert_no_payment(lambda: c.board(max_price_usdc=cap))
+            self.assertEqual(self.http.calls, [])
+        for method in ("risk", "last"):
+            c = self.make()
+            self.assert_no_payment(lambda: getattr(c, method)(MINT, max_price_usdc="1.000001"))
+            self.assertEqual(self.http.calls, [])
+        c = self.make(); board_offer(self.sdk)
+        self.assert_no_payment(lambda: c.board())  # Default 0.01 never becomes permission for more.
+
+    def test_board_offer_count_query_and_arithmetic_checked_before_key_loading(self):
+        mutations = [lambda x: x.pop("hodloddsBoard"), lambda x: x.pop("memo"),
+            lambda x: x.update(memo="unbound-query"),
+            lambda x: x.pop("hodloddsBoardSignature"), lambda x: x.update(hodloddsBoardSignature="bad"),
+            lambda x: x["hodloddsBoard"].update(nonce="short"),
+            lambda x: x["hodloddsBoard"].update(version=2),
+            lambda x: x["hodloddsBoard"].update(unrecognized=True),
+            lambda x: x["hodloddsBoard"].update(priced_n=True),
+            lambda x: x["hodloddsBoard"].update(priced_n=0),
+            lambda x: x["hodloddsBoard"].update(priced_n=51),
+            lambda x: x["hodloddsBoard"].update(priced_n=11),
+            lambda x: x["hodloddsBoard"]["query"].update(limit=100),
+            lambda x: x["hodloddsBoard"]["query"].update(limit=50.0),
+            lambda x: x["hodloddsBoard"]["query"].update(sort="riskiest"),
+            lambda x: x["hodloddsBoard"]["query"].update(filters={"min_risk": 0.5})]
+        for mutate in mutations:
+            c = self.make(); board_offer(self.sdk)
+            mutate(self.sdk.offer["accepts"][0]["extra"])
+            self.assert_no_payment(lambda: c.board(max_price_usdc=".5"))
+            self.assertEqual(self.sdk.loads, 0)
+        c = self.make(); board_offer(self.sdk)
+        self.sdk.offer["accepts"][0]["amount"] = "50001"
+        self.assert_no_payment(lambda: c.board(max_price_usdc=".5"))
+
+    def test_board_empty_is_free_and_changed_matches_is_not_retried(self):
+        c = self.make([Response(200, body={"schema": "hodlodds.board.v1", "rows": [], "returned": 0})])
+        answer = c.board()
+        self.assertFalse(answer.paid)
+        self.assertEqual(answer.data["rows"], [])
+        self.assertEqual(self.sdk.loads, 0)
+        for status in (409, 503):
+            c = self.make([challenge(), Response(status)])
+            board_offer(self.sdk, n=2)
+            self.assert_uncertain_once(lambda: c.board(), status)
 
 
 class ConfigTests(unittest.TestCase):
@@ -400,9 +509,44 @@ class CLITests(unittest.TestCase):
             self.assertEqual(code, 1); self.assertNotIn("Traceback", err); self.assertNotIn("DO_NOT_PRINT", err)
             self.assertEqual(sdk.signs, 0)
 
+    def test_cli_board_dynamic_total_and_all_filter_flags(self):
+        sdk = FakeSDK()
+        board_offer(sdk, n=37, limit=100, sort="active", max_risk=.5, min_risk=.01,
+                    min_liquidity_sol=100, min_age_min=60, max_age_min=1440, min_trades_5=2, min_confidence="high")
+        args = ["board", "--pay-to", PAYTO, "--limit", "100", "--sort", "active", "--max-price", "0.5",
+                "--max-risk", ".5", "--min-risk", ".01", "--min-liquidity", "100", "--min-age", "60",
+                "--max-age", "1440", "--min-trades", "2", "--min-confidence", "high"]
+        code, out, err, http, sdk = self.run_cli(args, [challenge(), Response(200, {"PAYMENT-RESPONSE": "receipt"})], sdk)
+        self.assertEqual(code, 0, err)
+        self.assertIn("Paid 0.185", out)
+        self.assertIn("min_confidence=high", http.calls[0][1])
+        sdk = FakeSDK(); board_offer(sdk, n=500, limit=500)
+        code, out, err, _, _ = self.run_cli(["board", "--pay-to", PAYTO, "--limit", "500", "--max-price", "2.5"],
+                                          [challenge(), Response(200, {"PAYMENT-RESPONSE": "receipt"})], sdk)
+        self.assertEqual(code, 0, err)
+        self.assertIn("Paid 2.5", out)
+
+    def test_cli_board_only_flags_and_invalid_bounds_never_sign(self):
+        for args, expected in ((["risk", MINT, "--limit", "10"], 2),
+                               (["board", "--limit", "9"], 1), (["board", "--limit", "501"], 1),
+                               (["board", "--min-trades", "1.5"], 2),
+                               (["board", "--sort", "lowest"], 2),
+                               (["board", "--max-price", "2.500001"], 1),
+                               (["risk", MINT, "--max-price", "2.5"], 1)):
+            code, _, err, http, sdk = self.run_cli(args, [])
+            self.assertEqual(code, expected, err)
+            self.assertEqual(http.calls, [])
+            self.assertEqual(sdk.signs, 0)
+
 
 class SDKIntegrationTests(unittest.TestCase):
     def test_pinned_sdk_codec_and_signature_with_all_rpc_mocked(self):
+        self.real_sdk_payment()
+
+    def test_pinned_sdk_preserves_board_offer_binding_with_all_rpc_mocked(self):
+        self.real_sdk_payment(board=True)
+
+    def real_sdk_payment(self, board=False):
         try:
             import base64
             from solders.keypair import Keypair
@@ -419,6 +563,13 @@ class SDKIntegrationTests(unittest.TestCase):
         requirement["accepts"][0].update(payTo=str(recipient.pubkey()))
         requirement["accepts"][0]["extra"]["feePayer"] = str(fee.pubkey())
         receipt = settlement(); receipt.update(payer=str(payer.pubkey()))
+        if board:
+            requirement["accepts"][0]["amount"] = receipt["amount"] = "2500000"
+            requirement["accepts"][0]["extra"]["hodloddsBoard"] = {
+                "version": 1, "query": client._board_query(500, "safest", {"min_liquidity_sol": 100}),
+                "priced_n": 500, "nonce": "a" * 32}
+            requirement["accepts"][0]["extra"]["hodloddsBoardSignature"] = "b" * 64
+            requirement["accepts"][0]["extra"]["memo"] = board_memo(requirement["accepts"][0]["extra"]["hodloddsBoard"])
         transport = FakeHTTP([
             Response(402, {"PAYMENT-REQUIRED": encode_payment_required_header(PaymentRequired.model_validate(requirement))}),
             Response(200, {"PAYMENT-RESPONSE": encode_payment_response_header(SettleResponse.model_validate(receipt))})])
@@ -431,12 +582,14 @@ class SDKIntegrationTests(unittest.TestCase):
                           return_value=SimpleNamespace(token_program=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), decimals=6)), \
                     patch("x402.mechanisms.svm.exact.client.resolve_blockhash", return_value=Hash.default()):
                 with client.HodlOdds("http://127.0.0.1:8010", keypair=key, pay_to=str(recipient.pubkey())) as c:
-                    answer = c.risk(MINT)
+                    answer = c.board(limit=500, min_liquidity_sol=100, max_price_usdc="2.5") if board else c.risk(MINT)
         self.assertTrue(answer.paid)
         self.assertEqual(len(transport.calls), 2)
         payload = decode_payment_signature_header(transport.calls[1][2]["PAYMENT-SIGNATURE"])
         tx = VersionedTransaction.from_bytes(base64.b64decode(payload.payload["transaction"]))
-        self.assertEqual(payload.accepted.amount, "10000")
+        self.assertEqual(payload.accepted.amount, "2500000" if board else "10000")
+        if board:
+            self.assertEqual(payload.accepted.extra["hodloddsBoard"], requirement["accepts"][0]["extra"]["hodloddsBoard"])
         self.assertTrue(tx.signatures[1].verify(payer.pubkey(), bytes([128]) + bytes(tx.message)))
 
 
