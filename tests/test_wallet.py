@@ -101,6 +101,26 @@ class WalletTests(unittest.TestCase):
                     self.assertIn("usage:", err)
         key.assert_not_called()
 
+    def test_base_sepolia_wallet_prints_address_only_and_refuses_mainnet(self):
+        from types import SimpleNamespace
+        public = "0x1111111111111111111111111111111111111111"
+        account = SimpleNamespace(key=bytes(range(32)), address=public)
+        with mock.patch.object(wallet, "_evm_account", return_value=account), mock.patch.object(wallet, "_keypair") as sol:
+            code, out, err = self.call(["new", "--network", "base-sepolia", str(self.path)])
+            self.assertEqual((code, out, err), (0, public + "\n", "")); sol.assert_not_called()
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(self.path.read_text()), {"private_key": "0x" + bytes(range(32)).hex()})
+        with mock.patch.object(wallet, "_evm_account") as create:
+            for network in ("base", "solana", "mainnet"):
+                self.assertEqual(self.call(["new", "--network", network, "new.json"])[0], 2)
+            create.assert_not_called()
+
+    def test_base_failure_redacts_secret_and_cleans_partial_file(self):
+        secret = "EVM_SECRET_MUST_NOT_ESCAPE"
+        with mock.patch.object(wallet, "_evm_account", side_effect=RuntimeError(secret)):
+            code, out, err = self.call(["new", str(self.path), "--network", "base-sepolia"])
+        self.assertEqual((code, out), (1, "")); self.assertNotIn(secret, err); self.assertFalse(self.path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

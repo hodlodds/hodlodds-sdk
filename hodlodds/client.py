@@ -1,16 +1,16 @@
-"""HodlOdds Python client: pay-per-answer crash odds over x402 v2 (Solana USDC).
+"""HodlOdds Python client: x402 v2 exact USDC on Solana or Base.
 
     from hodlodds import HodlOdds
-    client = HodlOdds("https://api.hodlodds.com", keypair="~/.config/hodlodds/devnet-payer.json",
-                      network="devnet", pay_to="<RECIPIENT FROM /v1/meta>")
+    client = HodlOdds("https://api.hodlodds.com", keypair="~/.config/hodlodds/payer.json",
+                      network="solana", pay_to="<RECIPIENT FROM /v1/meta>")
     answer = client.risk("<MINT>")
     print(answer.data["row"], answer.payment)
 
 Free routes (status, meta, "not covered", "feed interrupted", "too old") never sign
 anything. A payment is signed only after the server's 402 offer passes every check:
-x402 v2, the chosen Solana network, exact USDC, the pinned payTo address and a price
+x402 v2, the chosen network, exact USDC, the pinned payTo address and a price
 no higher than your limit. A payment is never retried automatically. The key file
-(solana-keygen JSON, mode 0600) is read locally and never printed or sent anywhere;
+(Solana JSON or EVM hex/JSON, mode 0600) is read locally and never printed or sent anywhere;
 only the SDK-signed USDC transfer authorization leaves the machine.
 """
 import argparse
@@ -21,20 +21,14 @@ import os
 import re
 import stat
 import sys
+import secrets
 from decimal import Decimal, DecimalException
 from importlib.metadata import version
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse
 
 SDK_VERSION = "2.25.0"
-NETWORKS = {
-    "devnet": {"caip2": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
-               "usdc": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
-               "rpc": "https://api.devnet.solana.com", "explorer": "?cluster=devnet"},
-    "mainnet": {"caip2": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-                "usdc": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                "rpc": "https://api.mainnet-beta.solana.com", "explorer": ""},
-}
+NETWORKS = ("devnet", "solana", "mainnet", "base", "base-sepolia")
 ADDRESS = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
 USDC_ATOMIC = Decimal(10) ** 6
 HARD_MAX_USDC = Decimal("1")
@@ -58,6 +52,67 @@ class HodlOddsError(Exception):
         self.status, self.body, self.payment = status, body, payment
 
 
+class PendingPayment(dict):
+    """Public receipt fields; redeem credentials stay out of repr/JSON/logs."""
+    def __init__(self, fields, *, signature, url, base):
+        super().__init__(fields)
+        self._signature, self._url, self._base = signature, url, base
+
+
+def save_pending(payment, directory=None):
+    if not isinstance(payment, PendingPayment):
+        raise HodlOddsError("no pending payment to save")
+    directory = Path(directory or '~/.config/hodlodds/pending').expanduser().absolute()
+    try:
+        # Never traverse a symlink, including one on a parent directory.
+        if any(p.is_symlink() for p in (directory, *directory.parents)):
+            raise ValueError()
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if os.fstat(dfd).st_uid != os.geteuid():
+                raise ValueError()
+            os.fchmod(dfd, 0o700)
+            name = secrets.token_hex(16) + '.json'
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            with os.fdopen(fd, 'w') as target:
+                os.fchmod(target.fileno(), 0o600)
+                json.dump(dict(schema='hodlodds.pending.v1', payment=dict(payment),
+                    signature=payment._signature, url=payment._url, base=payment._base), target)
+                target.flush(); os.fsync(target.fileno())
+        finally:
+            os.close(dfd)
+        return directory / name
+    except Exception:
+        raise HodlOddsError("cannot save pending payment securely") from None
+
+
+def load_pending(filename):
+    try:
+        path = Path(filename).expanduser().absolute()
+        if any(p.is_symlink() for p in (path, *path.parents)):
+            raise ValueError()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as source:
+            info = os.fstat(source.fileno())
+            if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_uid != os.geteuid() or info.st_size > 100000):
+                raise ValueError()
+            value = json.load(source)
+        if (value['schema'] != 'hodlodds.pending.v1'
+                or not isinstance(value['payment'], dict)
+                or value['payment'].get('network') not in NETWORKS
+                or not isinstance(value['payment'].get('pay_to'), str)
+                or not isinstance(value['url'], str) or not isinstance(value['base'], str)
+                or not isinstance(value['signature'], str) or not value['signature']
+                or len(value['signature']) > MAX_SIGNATURE_HEADER
+                or not value['signature'].isascii() or any(c.isspace() for c in value['signature'])):
+            raise ValueError()
+        return PendingPayment(value['payment'], signature=value['signature'], url=value['url'], base=value['base'])
+    except Exception:
+        raise HodlOddsError("cannot load pending payment: use its private 0600 non-symlink file") from None
+
+
 class Answer:
     def __init__(self, status, data, payment=None):
         self.status, self.data, self.payment = status, data, payment
@@ -70,6 +125,42 @@ class Answer:
         return "Answer(status=%r, paid=%r)" % (self.status, self.paid)
 
 
+def _network_config(network):
+    # never silently fall back to a remembered
+    # token address or a different chain. Missing pinned SDK constants is fatal.
+    try:
+        if version("x402") != SDK_VERSION:
+            raise ValueError()
+        if network in ("devnet", "solana", "mainnet"):
+            from x402.mechanisms.svm import constants as svm
+            test = network == "devnet"
+            return {"family": "svm", "testnet": test,
+                    "caip2": svm.SOLANA_DEVNET_CAIP2 if test else svm.SOLANA_MAINNET_CAIP2,
+                    "usdc": svm.USDC_DEVNET_ADDRESS if test else svm.USDC_MAINNET_ADDRESS,
+                    "rpc": svm.DEVNET_RPC_URL if test else svm.MAINNET_RPC_URL,
+                    "explorer": "https://explorer.solana.com/tx/", "explorer_suffix": "?cluster=devnet" if test else ""}
+        from x402.mechanisms.evm.v1.constants import V1_NETWORK_CHAIN_IDS
+        from x402.mechanisms.evm.default_assets import DEFAULT_ASSETS
+        caip2 = "eip155:" + str(V1_NETWORK_CHAIN_IDS[network])
+        choices = [a for a in DEFAULT_ASSETS[caip2] if a["symbol"] == "USDC" and a["decimals"] == 6]
+        if len(choices) != 1 or choices[0].get("asset_transfer_method", "eip3009") != "eip3009":
+            raise ValueError()
+        asset = choices[0]; test = network == "base-sepolia"
+        return {"family": "evm", "testnet": test, "caip2": caip2, "usdc": asset["asset"],
+                "name": asset["name"], "version": asset["version"], "rpc": None,
+                "explorer": "https://sepolia.basescan.org/tx/" if test else "https://basescan.org/tx/", "explorer_suffix": ""}
+    except Exception:
+        raise HodlOddsError("pinned SDK network/USDC constants unavailable; install x402[svm,evm]==" + SDK_VERSION) from None
+
+
+def _evm_address(value):
+    try:
+        from eth_utils import is_checksum_address
+        return isinstance(value, str) and bool(is_checksum_address(value)) and int(value, 16) != 0
+    except Exception:
+        return False
+
+
 def _usdc(value, name, maximum=HARD_MAX_USDC):
     message = name + " must be above 0, at most %s USDC, with at most 6 decimals" % maximum
     try:
@@ -79,7 +170,7 @@ def _usdc(value, name, maximum=HARD_MAX_USDC):
         amount = Decimal(text)
         if not amount.is_finite() or not 0 < amount <= maximum:
             raise ValueError()
-        # local (2026-10-17, Codex r54): Decimal multiplication can round away
+        # Decimal multiplication can round away
         # fractional atoms. Work on the exact coefficient/exponent instead.
         _, digits, exponent = amount.as_tuple()
         coefficient = int("".join(map(str, digits)))
@@ -99,7 +190,7 @@ def _usdc(value, name, maximum=HARD_MAX_USDC):
 
 
 def _board_query(limit, sort, filters):
-    # local (2026-10-17, Codex r59): validate before HTTP/key access and send a
+    # validate before HTTP/key access and send a
     # canonical query; the returned offer must describe this same selection.
     if type(limit) is not int or not 10 <= limit <= 500:
         raise HodlOddsError("limit must be an integer between 10 and 500")
@@ -167,7 +258,7 @@ def _base_url(value, *, rpc=False):
     return value if rpc else value.rstrip("/")
 
 
-def _load_keypair(path):
+def _read_key_file(path):
     fd = None
     try:
         p = Path(path).expanduser()
@@ -185,13 +276,8 @@ def _load_keypair(path):
             raw = f.read(MAX_KEY_BYTES + 1)
         if len(raw) > MAX_KEY_BYTES:
             raise ValueError()
-        data = json.loads(raw)
-        if not (isinstance(data, list) and len(data) == 64 and all(type(v) is int and 0 <= v <= 255 for v in data)):
-            raise ValueError()
-        from solders.keypair import Keypair
-        return Keypair.from_bytes(bytes(data))
+        return raw
     except Exception:
-        # No parser/SDK error, filename, JSON doc or key bytes escapes this seam.
         pass
     finally:
         if fd is not None:
@@ -199,7 +285,46 @@ def _load_keypair(path):
                 os.close(fd)
             except OSError:
                 pass
+    raise HodlOddsError("cannot load key: use a regular non-symlink file, mode 0600, at most 4096 bytes")
+
+
+def _load_keypair(path):
+    try:
+        data = json.loads(_read_key_file(path))
+        if not (isinstance(data, list) and len(data) == 64 and all(type(v) is int and 0 <= v <= 255 for v in data)):
+            raise ValueError()
+        from solders.keypair import Keypair
+        return Keypair.from_bytes(bytes(data))
+    except Exception:
+        # No parser/SDK error, filename, JSON doc or key bytes escapes this seam.
+        pass
     raise HodlOddsError("cannot load key: use a regular non-symlink solana-keygen file, mode 0600, and installed SDK dependencies")
+
+
+def _load_evm_account(path):
+    try:
+        raw = _read_key_file(path).decode("ascii").strip()
+        # Accept a hex file, JSON hex string, {"private_key": "0x..."}, or a
+        # JSON array of exactly 32 bytes. No mnemonics or encrypted-keystore guess.
+        if raw.startswith(("[", "{", '"')):
+            raw = json.loads(raw)
+        if isinstance(raw, dict):
+            if set(raw) != {"private_key"}:
+                raise ValueError()
+            raw = raw["private_key"]
+        if isinstance(raw, list):
+            if len(raw) != 32 or any(type(v) is not int or not 0 <= v <= 255 for v in raw):
+                raise ValueError()
+            key = bytes(raw)
+        elif isinstance(raw, str) and re.fullmatch(r"(?:0x)?[0-9a-fA-F]{64}", raw):
+            key = bytes.fromhex(raw[2:] if raw.startswith("0x") else raw)
+        else:
+            raise ValueError()
+        from eth_account import Account
+        return Account.from_key(key)
+    except Exception:
+        pass
+    raise HodlOddsError("cannot load EVM key: use a regular non-symlink 0600 hex/JSON private-key file and installed x402[evm] dependencies")
 
 
 def _new_http(timeout, headers):
@@ -221,17 +346,25 @@ class _Reply:
 
 class HodlOdds:
     def __init__(self, base_url, *, keypair=None, network="devnet", pay_to=None, max_price_usdc="0.01",
-                 rpc_url=None, timeout=30.0, access_headers=None):
+                 rpc_url=None, timeout=30.0, access_headers=None, paid_timeout=90.0):
         if network not in NETWORKS:
-            raise HodlOddsError("network must be devnet or mainnet")
-        if pay_to is not None and not _address(pay_to):
-            raise HodlOddsError("pay_to must be a Solana address")
-        if network == "mainnet" and pay_to is None:
+            raise HodlOddsError("network must be solana, devnet, base or base-sepolia (mainnet is a Solana alias)")
+        if network in ("mainnet", "solana", "base") and pay_to is None:
             raise HodlOddsError("mainnet requires an explicit pinned pay_to address")
         self.base = _base_url(base_url)
-        self.network, self.net = network, NETWORKS[network]
+        self.network, self.net = network, _network_config(network)
+        self._address_check = _evm_address if self.net["family"] == "evm" else _address
+        if pay_to is not None and not self._address_check(pay_to):
+            raise HodlOddsError("pay_to must be a nonzero EIP-55 checksum address" if self.net["family"] == "evm" else "pay_to must be a Solana address")
         self.pay_to, self.max_atomic = pay_to, _usdc(max_price_usdc, "max_price_usdc")
-        self.rpc_url, self._keypair_path = _base_url(rpc_url or self.net["rpc"], rpc=True), keypair
+        # The paid request waits for verification and on-chain settlement; in rare
+        # facilitator trouble the server needs up to ~70 s (retry + on-chain
+        # confirmation). Leaving earlier means paying without receiving the answer.
+        if type(paid_timeout) not in (int, float) or not 30 <= paid_timeout <= 600:
+            raise HodlOddsError("paid_timeout must be between 30 and 600 seconds")
+        self.paid_timeout = float(paid_timeout)
+        rpc = rpc_url or self.net["rpc"]
+        self.rpc_url, self._keypair_path = _base_url(rpc, rpc=True) if rpc else None, keypair
         self._sdk, self._codecs = None, None
         headers = dict(access_headers or {})
         for k, v in headers.items():
@@ -239,7 +372,7 @@ class HodlOdds:
                     or any(c in k + v for c in "\r\n") or k.lower().startswith(("payment-", "x-payment"))
                     or k.lower() in ("host", "content-length", "transfer-encoding")):
                 raise HodlOddsError("access_headers contains an invalid or reserved payment/transport header")
-        headers["User-Agent"] = "hodlodds-python/0.1"
+        headers["User-Agent"] = "hodlodds-python/0.2"
         try:
             self.http = _new_http(timeout, headers)
         except Exception:
@@ -300,11 +433,11 @@ class HodlOdds:
             raise HodlOddsError("HTTP %d on %s" % (r.status_code, path), r.status_code, _body(r))
         return _json_object(r)
 
-    def _request(self, url, headers=None):
-        # local (2026-10-17, Codex r54): bounded streaming also limits malicious
+    def _request(self, url, headers=None, timeout=None):
+        # bounded streaming also limits malicious
         # decoded gzip bodies. No redirects, environment proxy or automatic retry.
         try:
-            with self.http.stream("GET", url, headers=headers or {}) as r:
+            with self.http.stream("GET", url, headers=headers or {}, **({"timeout": timeout} if timeout else {})) as r:
                 items = list(r.headers.multi_items())
                 if sum(len(k.encode()) + len(v.encode()) for k, v in items) > MAX_HEADERS:
                     raise HodlOddsError("response headers exceed the client size limit", r.status_code)
@@ -338,7 +471,7 @@ class HodlOdds:
                 self._codecs = {"decode": decode_payment_required_header, "settled": decode_payment_response_header,
                                 "encode": encode_payment_signature_header}
             except Exception:
-                raise HodlOddsError("install the pinned x402[svm]==%s SDK" % SDK_VERSION) from None
+                raise HodlOddsError("install the pinned x402[svm,evm]==%s SDK" % SDK_VERSION) from None
         return self._codecs
 
     def _sdk_client(self):
@@ -348,16 +481,19 @@ class HodlOdds:
             self._protocol()
             try:
                 from x402 import x402ClientSync
-                from x402.mechanisms.svm.constants import (SOLANA_DEVNET_CAIP2, SOLANA_MAINNET_CAIP2,
-                                                           USDC_DEVNET_ADDRESS, USDC_MAINNET_ADDRESS)
-                from x402.mechanisms.svm.exact.client import ExactSvmScheme
-                from x402.mechanisms.svm.signers import KeypairSigner
-                pinned = {"devnet": (SOLANA_DEVNET_CAIP2, USDC_DEVNET_ADDRESS),
-                          "mainnet": (SOLANA_MAINNET_CAIP2, USDC_MAINNET_ADDRESS)}[self.network]
-                if pinned != (self.net["caip2"], self.net["usdc"]):
+                if _network_config(self.network) != self.net:
                     raise HodlOddsError("pinned SDK network constants changed")
-                signer = KeypairSigner(_load_keypair(self._keypair_path))
-                client = x402ClientSync().register(self.net["caip2"], ExactSvmScheme(signer, rpc_url=self.rpc_url))
+                if self.net["family"] == "svm":
+                    from x402.mechanisms.svm.exact.client import ExactSvmScheme
+                    from x402.mechanisms.svm.signers import KeypairSigner
+                    signer = KeypairSigner(_load_keypair(self._keypair_path))
+                    scheme = ExactSvmScheme(signer, rpc_url=self.rpc_url)
+                else:
+                    from x402.mechanisms.evm.exact.client import ExactEvmScheme
+                    from x402.mechanisms.evm.signers import EthAccountSigner
+                    signer = EthAccountSigner(_load_evm_account(self._keypair_path))
+                    scheme = ExactEvmScheme(signer)
+                client = x402ClientSync().register(self.net["caip2"], scheme)
                 self._sdk = dict(self._codecs, payer=signer.address, client=client)
             except HodlOddsError:
                 raise
@@ -365,20 +501,28 @@ class HodlOdds:
                 raise HodlOddsError("cannot initialize payment SDK; no authorization was sent") from None
         return self._sdk
 
-    def _check_offer(self, data, limit, board_query=None):
+    def _same_address(self, left, right):
+        return (isinstance(left, str) and isinstance(right, str) and
+                (left.lower() == right.lower() if self.net["family"] == "evm" else left == right))
+
+    def _select_offer(self, data):
         if not isinstance(data, dict) or type(data.get("x402Version")) is not int or data.get("x402Version") != 2:
             raise HodlOddsError("only x402 v2 offers are accepted")
         accepts = data.get("accepts")
-        if not isinstance(accepts, list) or len(accepts) != 1:
-            raise HodlOddsError("expected exactly one payment option")
-        row = accepts[0]
-        if not isinstance(row, dict):
-            raise HodlOddsError("invalid payment requirement")
-        if row.get("network") != self.net["caip2"]:
-            raise HodlOddsError("server asks for a different network than " + self.network)
-        if row.get("scheme") != "exact" or row.get("asset") != self.net["usdc"]:
+        if not isinstance(accepts, list) or not 1 <= len(accepts) <= 16:
+            raise HodlOddsError("invalid payment options")
+        matches = [(i, row) for i, row in enumerate(accepts) if isinstance(row, dict)
+                   and row.get("network") == self.net["caip2"] and self.pay_to is not None
+                   and self._same_address(row.get("payTo"), self.pay_to)]
+        if len(matches) != 1:
+            raise HodlOddsError("expected one payment option matching the configured network and pinned pay_to")
+        return matches[0]
+
+    def _check_offer(self, data, limit, board_query=None):
+        _, row = self._select_offer(data)
+        if row.get("scheme") != "exact" or not self._same_address(row.get("asset"), self.net["usdc"]):
             raise HodlOddsError("only exact USDC payments are accepted")
-        if self.pay_to is None or row.get("payTo") != self.pay_to:
+        if not self._address_check(row.get("payTo")) or not self._same_address(row.get("payTo"), self.pay_to):
             raise HodlOddsError("server payTo differs from the pinned pay_to address")
         amount = row.get("amount")
         if not (isinstance(amount, str) and re.fullmatch(r"[1-9][0-9]{0,6}", amount) and int(amount) <= limit):
@@ -386,15 +530,23 @@ class HodlOdds:
         extra = row.get("extra")
         if not isinstance(extra, dict) or extra.get("paymentFlow") != "authorization":
             raise HodlOddsError("only authorization payment flow is accepted")
-        if not _address(extra.get("feePayer")):
-            raise HodlOddsError("a valid facilitator feePayer is required")
         timeout = row.get("maxTimeoutSeconds")
         if type(timeout) is not int or not 0 < timeout <= 300:
             raise HodlOddsError("payment timeout must be between 1 and 300 seconds")
-        if "memo" in extra and (not isinstance(extra["memo"], str) or len(extra["memo"].encode()) > 256):
-            raise HodlOddsError("invalid or oversized payment memo")
-        if "recentBlockhash" in extra and not _address(extra["recentBlockhash"]):
-            raise HodlOddsError("invalid payment blockhash")
+        if self.net["family"] == "svm":
+            if not _address(extra.get("feePayer")):
+                raise HodlOddsError("a valid facilitator feePayer is required")
+            if "memo" in extra and (not isinstance(extra["memo"], str) or len(extra["memo"].encode()) > 32):
+                raise HodlOddsError("invalid or oversized payment memo (maximum 32 bytes)")
+            if "recentBlockhash" in extra and not _address(extra["recentBlockhash"]):
+                raise HodlOddsError("invalid payment blockhash")
+        else:
+            if extra.get("assetTransferMethod", "eip3009") != "eip3009":
+                raise HodlOddsError("only EIP-3009 exact USDC authorizations are accepted; Permit2 is disabled")
+            if extra.get("name") != self.net["name"] or extra.get("version") != self.net["version"]:
+                raise HodlOddsError("USDC signing domain differs from the pinned SDK")
+            if any(name in extra for name in ("memo", "feePayer", "recentBlockhash")):
+                raise HodlOddsError("Solana transaction fields are not accepted in a Base offer")
         if board_query is not None:
             board = extra.get("hodloddsBoard")
             if (not isinstance(board, dict) or type(board.get("version")) is not int or board["version"] != 1
@@ -412,9 +564,39 @@ class HodlOdds:
             # 32 hex chars: the SPL Memo instruction must fit the SDK's 20,000 CU limit.
             expected_memo = hashlib.sha256(b"hodlodds.board.v1\0" + json.dumps(
                 board, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()[:32]
-            if extra.get("memo") != expected_memo:
+            if self.net["family"] == "svm" and extra.get("memo") != expected_memo:
                 raise HodlOddsError("board payment memo does not bind the requested query and count")
         return int(amount)
+
+    def redeem(self, payment):
+        """One explicit resend of the original authorization, without signing."""
+        if (not isinstance(payment, PendingPayment) or payment._base != self.base
+                or payment.get('network') != self.network or payment.get('pay_to') != self.pay_to
+                or not isinstance(payment._url, str) or not payment._url.startswith(self.base + '/v1/')
+                or not isinstance(payment._signature, str) or not payment._signature
+                or len(payment._signature) > MAX_SIGNATURE_HEADER
+                or not payment._signature.isascii() or any(c.isspace() for c in payment._signature)):
+            raise HodlOddsError("redeem requires the original payment, endpoint, network and recipient")
+        parsed = urlparse(payment._url)
+        if (parsed.fragment or parsed.username or parsed.password or '\\' in payment._url
+                or not (parsed.path == urlparse(self.base).path + '/v1/board'
+                    or parsed.path.startswith(urlparse(self.base).path + '/v1/risk/'))):
+            raise HodlOddsError("invalid redeem route")
+        response = None
+        try:
+            response = self._request(payment._url, headers={'PAYMENT-SIGNATURE': payment._signature, 'HodlOdds-Redeem': '1'})
+            tx = response.headers.get('hodlodds-redeemed')
+            if response.status_code != 200 or not tx:
+                raise HodlOddsError("redeem returned HTTP %d; no new payment was signed; keep the pending payment" % response.status_code)
+            if not (_base58_size(tx) == 64 if self.net['family'] == 'svm' else
+                    bool(re.fullmatch('0x[0-9a-fA-F]{64}', tx))):
+                raise HodlOddsError("invalid redeem receipt")
+            receipt = dict(payment, success=True, transaction=tx,
+                           explorer=self.net['explorer'] + tx + self.net['explorer_suffix'], redeemed=True)
+            return Answer(200, _json_object(response), receipt)
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, HodlOddsError) else 'redeem response unavailable; not retried'
+            raise HodlOddsError(reason, response.status_code if response else None, payment=payment) from None
 
     def _paid(self, path, max_price_usdc, board_query=None):
         maximum = BOARD_MAX_USDC if board_query is not None else HARD_MAX_USDC
@@ -434,18 +616,22 @@ class HodlOdds:
             parsed = protocol["decode"](header)
             offer = parsed.model_dump(by_alias=True, exclude_none=True)
             amount = self._check_offer(offer, limit, board_query)
+            index, selected = self._select_offer(offer)
+            # never let the SDK's default selector
+            # choose an unchecked alternative, including another same-chain offer.
+            parsed = parsed.model_copy(update={"accepts": [parsed.accepts[index]]}, deep=True)
         except HodlOddsError:
             raise
         except Exception:
             raise HodlOddsError("invalid PAYMENT-REQUIRED offer; nothing signed", 402) from None
         # Read the key only after all checks that do not need the payer address.
         sdk = self._sdk_client()
-        if not _address(sdk["payer"]) or sdk["payer"] == self.pay_to:
+        if not self._address_check(sdk["payer"]) or self._same_address(sdk["payer"], self.pay_to):
             raise HodlOddsError("payer and payTo must be different wallets")
-        if offer["accepts"][0]["extra"]["feePayer"] == sdk["payer"]:
+        if self.net["family"] == "svm" and selected["extra"]["feePayer"] == sdk["payer"]:
             raise HodlOddsError("payer must differ from the facilitator fee payer")
         try:
-            # local (2026-10-17, Codex r59): SDK 2.25.0 itself defaults to $1.
+            # SDK 2.25.0 itself defaults to $1.
             # Permit only this already-validated total; do not disable controls
             # or leave a board's larger allowance on the cached SDK instance.
             sdk["client"].set_spend_controls({"max_amount_per_payment": "$" + _fmt(str(amount))})
@@ -461,21 +647,30 @@ class HodlOdds:
             raise HodlOddsError("authorization construction failed; nothing sent and not retried") from None
         payment = {"amount_usdc": _fmt(str(amount)), "network": self.network, "success": None,
                    "transaction": None, "payer": sdk["payer"], "pay_to": self.pay_to, "explorer": None}
+        payment = PendingPayment(payment, signature=signature, url=url, base=self.base)
         paid = None
         try:
             # Exactly one authorized HTTP attempt. A lost/error response does
             # not establish absence of settlement, even on normally free errors.
-            paid = self._request(url, headers={"PAYMENT-SIGNATURE": signature})
+            paid = self._request(url, headers={"PAYMENT-SIGNATURE": signature}, timeout=self.paid_timeout)
             receipt = paid.headers.get("payment-response")
             if receipt:
                 info = protocol["settled"](receipt).model_dump(by_alias=True, exclude_none=True)
                 tx = info.get("transaction")
-                if _base58_size(tx) == 64:
+                if (_base58_size(tx) == 64 if self.net["family"] == "svm" else
+                        isinstance(tx, str) and bool(re.fullmatch("0x[0-9a-fA-F]{64}", tx))):
                     payment["transaction"] = tx
-                    payment["explorer"] = "https://explorer.solana.com/tx/%s%s" % (tx, self.net["explorer"])
+                    payment["explorer"] = self.net["explorer"] + tx + self.net["explorer_suffix"]
+                # Only a 402 carrying a reason is the facilitator declaring
+                # failure; any other status leaves the outcome unknown.
+                if info.get("success") is False and not tx and paid.status_code == 402 and info.get("errorReason"):
+                    reason = info.get('errorReason')
+                    reason = reason if isinstance(reason, str) and re.fullmatch('[a-zA-Z0-9_]{1,100}', reason) else 'unknown'
+                    payment['success'] = False
+                    raise HodlOddsError("the facilitator reported settlement failed: %s; usually nothing was charged — if your wallet shows the payment, redeem after ~2 minutes" % reason)
                 if (info.get("success") is not True or info.get("network") != self.net["caip2"]
                         or payment["transaction"] is None
-                        or ("payer" in info and info["payer"] != sdk["payer"])
+                        or ("payer" in info and not self._same_address(info["payer"], sdk["payer"]))
                         or ("amount" in info and info["amount"] != str(amount))):
                     raise HodlOddsError("invalid or unsuccessful PAYMENT-RESPONSE")
                 payment["success"] = True  # Server receipt, not independent RPC finality proof.
@@ -483,9 +678,14 @@ class HodlOdds:
                 raise HodlOddsError("authorized request returned HTTP %d" % paid.status_code)
             if not receipt:
                 raise HodlOddsError("200 without PAYMENT-RESPONSE")
-            return Answer(200, _json_object(paid), payment)
+            return Answer(200, _json_object(paid), dict(payment))
         except Exception as exc:
             reason = str(exc) if isinstance(exc, HodlOddsError) else "invalid payment response"
+            if payment["success"] is False:
+                # Facilitator-declared failure: say so plainly, keep the reconcile facts.
+                raise HodlOddsError(reason + ". Not retried. Check %(amount_usdc)s USDC on %(network)s from %(payer)s "
+                                    "to %(pay_to)s in your wallet history." % payment, paid.status_code if paid else None,
+                                    _body(paid) if paid else None, payment=payment) from None
             message = (reason + ". Settlement may have occurred; not retried. Reconcile %(amount_usdc)s USDC "
                        "on %(network)s from %(payer)s to %(pay_to)s against finalized wallet history and "
                        "the server payment records before another paid call. Transaction: %(transaction)s." % payment)
@@ -519,7 +719,7 @@ def _json_object(response):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="HodlOdds x402 client")
-    p.add_argument("command", choices=["status", "meta", "risk", "last", "board"])
+    p.add_argument("command", choices=["status", "meta", "risk", "last", "board", "redeem"])
     p.add_argument("mint", nargs="?")
     p.add_argument("--base-url", default=os.environ.get("HODLODDS_BASE_URL", "https://api.hodlodds.com"))
     p.add_argument("--network", default=os.environ.get("HODLODDS_NETWORK", "devnet"), choices=sorted(NETWORKS))
@@ -541,33 +741,46 @@ def main(argv=None):
     a = p.parse_args(args)
     if a.command in ("risk", "last") and not a.mint:
         p.error(a.command + " needs a mint address")
-    if a.command not in ("risk", "last") and a.mint:
+    if a.command == "redeem" and not a.mint:
+        p.error("redeem needs a pending payment file")
+    if a.command not in ("risk", "last", "redeem") and a.mint:
         p.error(a.command + " does not take a mint")
     explicit = lambda flag: any(v == flag or v.startswith(flag + "=") for v in args)
     board_flags = ("--limit", "--sort", "--max-risk", "--min-risk", "--min-liquidity", "--min-age",
                    "--max-age", "--min-trades", "--min-confidence")
     if a.command != "board" and any(explicit(flag) for flag in board_flags):
         p.error("board filters and sorting can be used only with board")
-    if a.network == "mainnet" and not (explicit("--network") and explicit("--pay-to")):
-        p.error("mainnet requires explicit --network mainnet and --pay-to; environment defaults are not enough")
+    if a.command != "redeem" and a.network in ("mainnet", "solana", "base") and not (explicit("--network") and explicit("--pay-to")):
+        p.error("mainnet requires explicit --network and --pay-to; environment defaults are not enough")
     try:
+        pending = load_pending(a.mint) if a.command == 'redeem' else None
+        if pending is not None:
+            a.base_url, a.network, a.pay_to = pending._base, pending['network'], pending['pay_to']
         with HodlOdds(a.base_url, keypair=a.keypair, network=a.network, pay_to=a.pay_to,
                       max_price_usdc="0.01" if a.command == "board" else a.max_price, rpc_url=a.rpc_url) as client:
             if a.command in ("status", "meta"):
                 print(json.dumps(getattr(client, a.command)(), indent=2))
                 return 0
-            if a.command == "board":
+            if a.command == "redeem":
+                answer = client.redeem(pending)
+            elif a.command == "board":
                 filters = {name: getattr(a, name) for name in BOARD_FILTERS if getattr(a, name) is not None}
                 answer = client.board(limit=a.limit, sort=a.sort, max_price_usdc=a.max_price, **filters)
             else:
                 answer = getattr(client, a.command)(a.mint)
             print(json.dumps(answer.data, indent=2))
             if answer.payment:
-                print("\nPaid %(amount_usdc)s USDC on %(network)s from %(payer)s\nTransaction: %(explorer)s" % answer.payment)
+                verb = "Redeemed (no new payment; paid earlier)" if answer.payment.get("redeemed") else "Paid"
+                print("\n" + verb + " %(amount_usdc)s USDC on %(network)s from %(payer)s\nTransaction: %(explorer)s" % answer.payment)
             return 0
     except HodlOddsError as e:
         print("HodlOdds: " + str(e), file=sys.stderr)
-        if e.body is not None:
+        if isinstance(e.payment, PendingPayment) and a.command != 'redeem':
+            try:
+                print("Pending payment saved: " + str(save_pending(e.payment)), file=sys.stderr)
+            except HodlOddsError as save_error:
+                print(str(save_error), file=sys.stderr)
+        if e.body is not None and e.payment is None:
             print(json.dumps(e.body, indent=2), file=sys.stderr)
         return 1
 

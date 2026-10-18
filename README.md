@@ -1,12 +1,12 @@
 # hodlodds — Python client
 
 Pay-per-answer **crash odds for Solana memecoins**, paid per request with
-[x402](https://www.x402.org) (USDC on Solana). No accounts, no API keys.
+[x402](https://www.x402.org) (USDC on Solana or Base). No accounts, no API keys.
 
 > **Status: pre-launch.** The API at `https://api.hodlodds.com` is not yet open for
 > payments. Its model is being evaluated against a pre-registered forward test.
 > A limited paid beta opens only if it passes. Until then this client is published
-> so you can read the code and test the payment flow on **Solana devnet**.
+> so you can read the code and test the payment flow on **Solana devnet** or **Base Sepolia**.
 
 ## What it answers
 
@@ -34,7 +34,7 @@ You only pay for fresh, covered answers. "Not covered", "feed interrupted" and
 pip install "git+https://github.com/hodlodds/hodlodds-sdk"
 ```
 
-Python 3.10+. Dependencies: `httpx` and the official `x402[svm]==2.25.0` SDK (pinned).
+Python 3.10+. Dependencies: `httpx` and the official `x402[svm,evm]==2.25.0` SDK (pinned).
 
 ## Use
 
@@ -43,6 +43,7 @@ Command line:
 ```sh
 hodlodds status
 hodlodds risk <MINT> --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIENT> --network devnet
+hodlodds risk <MINT> --keypair ~/.config/hodlodds/base-wallet.json --pay-to <BASE_RECIPIENT> --network base-sepolia
 hodlodds board --limit 100 --sort safest --max-risk 0.05 --min-liquidity 50 --max-price 0.5 \
   --keypair ... --pay-to ... --network devnet
 ```
@@ -67,6 +68,16 @@ with HodlOdds("https://api.hodlodds.com", keypair="~/.config/hodlodds/wallet.jso
 README at launch). Pin it in your code: the client refuses any offer that pays
 someone else.
 
+Networks: `devnet` and `solana` (mainnet; `mainnet` is an alias) take a Solana
+JSON key file; `base-sepolia` and `base` take an EVM key file
+(`{"private_key": "0x..."}`, mode 0600). Prices are the same on both chains, and the
+API offers both; the client signs only on the network you chose.
+
+```python
+base = HodlOdds("https://api.hodlodds.com", keypair="~/.config/hodlodds/base-wallet.json",
+                network="base", pay_to="<BASE_RECIPIENT>", max_price_usdc="0.01")
+```
+
 Board options: `limit` 10–500 (default 50); `sort` = `safest` (default), `riskiest`,
 `liquidity`, `newest`, `active`; filters `max_risk`, `min_risk`, `min_liquidity_sol`,
 `min_age_min`, `max_age_min`, `min_trades_5`, `min_confidence` (`high`/`medium`/`low`).
@@ -78,6 +89,22 @@ board = client.board(limit=100, sort="safest", max_risk=0.05, min_liquidity_sol=
 for row in board.data["rows"]:
     print(row["mint"], row["p_crash_60m"], row["confidence"]["level"])
 ```
+
+### If an answer is lost after you paid
+
+The paid request waits up to 90 seconds (`paid_timeout`, 30–600): verification and
+on-chain settlement usually take one to three seconds. If the connection still ends
+after the payment settled, nothing is lost:
+
+- The server keeps that payment redeemable **once** for 24 hours.
+- In Python, the error carries it: `client.redeem(error.payment)` re-sends the same
+  authorization with `HodlOdds-Redeem: 1`. It never signs a new payment and never
+  settles a second time.
+- The CLI saves it to `~/.config/hodlodds/pending/<id>.json` (mode 0600) and prints
+  the path; run `hodlodds redeem <file>` after about two minutes.
+- While the server is still confirming the payment on-chain, a redeem answers
+  `409` with `Retry-After`; if the payment never settled, it says so (nothing was
+  charged).
 
 Environment variables for the CLI: `HODLODDS_BASE_URL`, `HODLODDS_NETWORK`,
 `HODLODDS_KEYPAIR`, `HODLODDS_PAY_TO`, `HODLODDS_MAX_PRICE`.
@@ -91,22 +118,24 @@ Exit status: `0` success, `1` refusal/API/transport failure, `2` invalid usage.
   below your limit (default 0.01 USDC, hard cap 1 USDC; exact atomic arithmetic).
 - Payments are **never retried automatically**. If anything goes wrong after an
   authorization was sent, the error says so and carries the details
-  (`HodlOddsError.payment`) so you can reconcile against your wallet history.
+  (`HodlOddsError.payment`) so you can reconcile against your wallet history or
+  redeem the answer once (see above).
 - The key file must be a regular, non-symlink file with mode 0600. It is read
   locally and never printed or sent; only the SDK-signed USDC transfer
   authorization leaves your machine. Use a dedicated low-balance wallet.
 - HTTPS only (plain HTTP only for a local test server). No redirects, no
   environment proxies, bounded headers and bodies.
-- Mainnet requires an explicit `network="mainnet"` and a pinned `pay_to`; the CLI
-  requires `--network mainnet --pay-to ...` on the command line.
+- Mainnets require an explicit `network="solana"` (or `"base"`) and a pinned
+  `pay_to`; the CLI requires `--network solana|base --pay-to ...` on the command line.
 
-## Test wallet (devnet)
+## Test wallet (devnet / Base Sepolia)
 
 ```sh
 hodlodds-wallet new ~/.config/hodlodds/my-devnet.json   # prints the public address only
+hodlodds-wallet new --network base-sepolia ~/.config/hodlodds/base-sepolia.json
 ```
 
-Fund it with devnet USDC at https://faucet.circle.com (network: Solana Devnet).
+Fund it with test USDC at https://faucet.circle.com (network: Solana Devnet or Base Sepolia).
 Never put real funds in a test wallet.
 
 ## Tests

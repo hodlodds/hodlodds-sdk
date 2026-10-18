@@ -21,21 +21,50 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hodlodds import client
 
-PAYTO = "5Bz2LJZLDMTUaNfh9qvUEKeQkV7sRSnTvbbXgnzKpPk6"
+PAYTO = "Bga5h69rmgYbxZgLxVQGsevn4aBLPnN5vQEnZRQmXGkn"
 PAYER = "So11111111111111111111111111111111111111112"
 FEE = "11111111111111111111111111111111"
 MINT = "CY8tK7zPvoRAL5tugvxBEgFEtrgAXiikTAKVgh61Siq5"
 TX = "2" + "1" * 87  # 64-byte base58 signature shape; synthetic, never on chain.
+BASE_PAYTO = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"  # EIP-55 example address; never funded by tests.
+BASE_PAYER = "0x1111111111111111111111111111111111111111"
+BASE_TX = "0x" + "a" * 64
+FIXTURE_NETWORKS = {
+    "devnet": {"family": "svm", "testnet": True, "caip2": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+               "usdc": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU", "rpc": "https://api.devnet.solana.com",
+               "explorer": "https://explorer.solana.com/tx/", "explorer_suffix": "?cluster=devnet"},
+    "solana": {"family": "svm", "testnet": False, "caip2": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+               "usdc": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "rpc": "https://api.mainnet-beta.solana.com",
+               "explorer": "https://explorer.solana.com/tx/", "explorer_suffix": ""},
+    "base": {"family": "evm", "testnet": False, "caip2": "eip155:8453", "usdc": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+             "name": "USD Coin", "version": "2", "rpc": None, "explorer": "https://basescan.org/tx/", "explorer_suffix": ""},
+    "base-sepolia": {"family": "evm", "testnet": True, "caip2": "eip155:84532", "usdc": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                     "name": "USDC", "version": "2", "rpc": None, "explorer": "https://sepolia.basescan.org/tx/", "explorer_suffix": ""},
+}
+FIXTURE_NETWORKS["mainnet"] = FIXTURE_NETWORKS["solana"]
+REAL_NETWORK_CONFIG = client._network_config
+
+
+def setUpModule():
+    # Offline seam: production obtains these from the installed pinned SDK,
+    # never these test fixtures. No network or SDK installation is needed here.
+    global _network_patch
+    _network_patch = patch.object(client, "_network_config", side_effect=lambda name: copy.deepcopy(FIXTURE_NETWORKS[name]))
+    _network_patch.start()
+
+
+def tearDownModule():
+    _network_patch.stop()
 
 
 def offer():
-    return {"x402Version": 2, "accepts": [{"scheme": "exact", "network": client.NETWORKS["devnet"]["caip2"],
-        "asset": client.NETWORKS["devnet"]["usdc"], "amount": "10000", "payTo": PAYTO, "maxTimeoutSeconds": 60,
+    return {"x402Version": 2, "accepts": [{"scheme": "exact", "network": FIXTURE_NETWORKS["devnet"]["caip2"],
+        "asset": FIXTURE_NETWORKS["devnet"]["usdc"], "amount": "10000", "payTo": PAYTO, "maxTimeoutSeconds": 60,
         "extra": {"paymentFlow": "authorization", "feePayer": FEE}}]}
 
 
 def settlement():
-    return {"success": True, "network": client.NETWORKS["devnet"]["caip2"], "transaction": TX,
+    return {"success": True, "network": FIXTURE_NETWORKS["devnet"]["caip2"], "transaction": TX,
             "payer": PAYER, "amount": "10000"}
 
 
@@ -60,6 +89,13 @@ class Decoded:
     def model_dump(self, **kwargs):
         return copy.deepcopy(self.data)
 
+    @property
+    def accepts(self):
+        return self.data["accepts"]
+
+    def model_copy(self, update, **kwargs):
+        return Decoded(dict(copy.deepcopy(self.data), **update))
+
 
 class FakeSDK:
     def __init__(self):
@@ -69,6 +105,7 @@ class FakeSDK:
         self.payer = PAYER
         self.decode_error = self.receipt_error = self.sign_error = None
         self.encoded = "TEST_AUTHORIZATION_DO_NOT_LOG"
+        self.signed_offer = None
 
     def decode(self, header):
         if self.decode_error:
@@ -89,6 +126,7 @@ class FakeSDK:
 
     def create_payment_payload(self, parsed):
         self.signs += 1
+        self.signed_offer = parsed.model_dump()
         if self.sign_error:
             raise self.sign_error
         return {"authorization": "fixture"}
@@ -130,8 +168,9 @@ class FakeHTTP:
         self.responses = list(responses)
         self.calls, self.closed = [], False
 
-    def stream(self, method, url, headers):
+    def stream(self, method, url, headers, timeout=None):
         self.calls.append((method, url, headers))
+        self.timeouts = getattr(self, "timeouts", []) + [timeout]
         if not self.responses:
             raise AssertionError("Unexpected automatic retry")
         response = self.responses.pop(0)
@@ -174,10 +213,20 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(error.payment["pay_to"], PAYTO)
         return error
 
+    def test_paid_request_waits_longer_than_free_ones(self):
+        # Simulation r71: a 30 s client timeout is shorter than a slow settlement (~70 s).
+        c = self.make()
+        c.risk(MINT)
+        self.assertEqual(self.http.timeouts, [None, 90.0])  # free challenge: client default; paid: 90 s
+        for bad in (10, 601, "90", True):
+            with self.subTest(bad=bad), self.assertRaisesRegex(client.HodlOddsError, "paid_timeout"):
+                with patch.object(client, "_new_http", return_value=FakeHTTP([])):
+                    client.HodlOdds("http://127.0.0.1:8010", pay_to=PAYTO, paid_timeout=bad)
+
     def test_every_invalid_offer_signs_nothing_and_does_not_load_key(self):
         changes = [lambda x: x.update(x402Version=1), lambda x: x.update(accepts=[]),
             lambda x: x["accepts"].append(copy.deepcopy(x["accepts"][0])), lambda x: x.update(accepts=[None])]
-        for key, val in (("network", client.NETWORKS["mainnet"]["caip2"]), ("asset", MINT), ("scheme", "upto"),
+        for key, val in (("network", FIXTURE_NETWORKS["mainnet"]["caip2"]), ("asset", MINT), ("scheme", "upto"),
                          ("payTo", PAYER), ("amount", "10001"), ("amount", "1000001"), ("amount", "1.1"),
                          ("amount", "-1"), ("amount", "0"), ("amount", "01"), ("amount", "１００００"),
                          ("amount", "1" * 1000), ("amount", 10000), ("amount", True),
@@ -401,6 +450,12 @@ class ClientTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_missing_or_changed_sdk_network_constants_fail_closed(self):
+        with patch.object(client, "version", return_value="wrong"):
+            for network in client.NETWORKS:
+                with self.assertRaisesRegex(client.HodlOddsError, "constants unavailable"):
+                    REAL_NETWORK_CONFIG(network)
+
     def test_exact_decimal_parsing_and_rejection_without_rounding(self):
         for val, expected in ((".01", 10000), ("1", 1000000), ("1.000000", 1000000),
                               (".000001", 1), ("1e-6", 1), ("0.0100000", 10000)):
@@ -468,8 +523,135 @@ class ConfigTests(unittest.TestCase):
                 self.assertNotIn(sentinel, repr(result.exception))
                 self.assertIsNone(result.exception.__context__)
 
+    def test_evm_key_file_formats_permissions_and_redaction(self):
+        secret = "1" * 64
+        fake = SimpleNamespace(Account=SimpleNamespace(from_key=lambda key: ("account", len(key))))
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"eth_account": fake}):
+            p = Path(tmp) / "evm-key"; p.touch(mode=0o600); p.chmod(0o600)
+            for value in (secret, "0x" + secret, json.dumps("0x" + secret), json.dumps({"private_key": "0x" + secret}), json.dumps([1] * 32)):
+                p.write_text(value)
+                self.assertEqual(client._load_evm_account(p), ("account", 32))
+            for value in (json.dumps([True] * 32), json.dumps([1] * 31), json.dumps({"private_key": secret, "extra": "x"}), secret[:-1], "not a key"):
+                p.write_text(value)
+                with self.assertRaises(client.HodlOddsError) as caught:
+                    client._load_evm_account(p)
+                self.assertIsNone(caught.exception.__context__)
+                self.assertNotIn(value, str(caught.exception))
+            p.write_text(secret); p.chmod(0o644)
+            with self.assertRaises(client.HodlOddsError):
+                client._load_evm_account(p)
+            p.chmod(0o600)
+            link = Path(tmp) / "symlink"; link.symlink_to(p)
+            with self.assertRaises(client.HodlOddsError):
+                client._load_evm_account(link)
+            fake.Account.from_key = lambda _: (_ for _ in ()).throw(ValueError(secret))
+            with self.assertRaises(client.HodlOddsError) as caught:
+                client._load_evm_account(p)
+            self.assertNotIn(secret, repr(caught.exception)); self.assertIsNone(caught.exception.__context__)
+
+
+class MultiNetworkTests(unittest.TestCase):
+    def make(self, network="base-sepolia", responses=None):
+        self.sdk = FakeSDK(); net = FIXTURE_NETWORKS[network]
+        self.http = FakeHTTP(responses or [challenge(), Response(200, {"PAYMENT-RESPONSE": "receipt"})])
+        extra = {"paymentFlow": "authorization", "name": net["name"], "version": net["version"]}
+        self.evm = {"scheme": "exact", "network": net["caip2"], "asset": net["usdc"], "amount": "10000",
+                    "payTo": BASE_PAYTO, "maxTimeoutSeconds": 60, "extra": extra}
+        self.sdk.offer["accepts"].append(self.evm)
+        self.sdk.payer = BASE_PAYER
+        self.sdk.receipt.update(network=net["caip2"], transaction=BASE_TX, payer=BASE_PAYER)
+        with patch.object(client, "_new_http", return_value=self.http), \
+                patch.object(client, "_evm_address", side_effect=lambda value: value in (BASE_PAYTO, BASE_PAYER)):
+            self.c = client.HodlOdds("http://127.0.0.1:8010", network=network, pay_to=BASE_PAYTO)
+        self.c._protocol = self.sdk.protocol; self.c._sdk_client = self.sdk.load
+        return self.c
+
+    def refusal(self, fn):
+        with self.assertRaises(client.HodlOddsError):
+            fn()
+        self.assertEqual(self.sdk.loads, 0); self.assertEqual(self.sdk.signs, 0)
+
+    def test_selects_only_matching_option_for_each_network(self):
+        for network in ("base", "base-sepolia"):
+            c = self.make(network)
+            result = c.risk(MINT)
+            self.assertTrue(result.paid)
+            self.assertEqual(self.sdk.signed_offer["accepts"], [self.evm])
+            self.assertEqual(result.payment["transaction"], BASE_TX)
+            self.assertIn("basescan.org", result.payment["explorer"])
+        c = self.make()
+        self.sdk.offer["accepts"].reverse()  # Solana still chooses its own offer in second place.
+        with patch.object(client, "_new_http", return_value=self.http):
+            solana = client.HodlOdds("http://127.0.0.1:8010", network="devnet", pay_to=PAYTO)
+        solana._protocol = self.sdk.protocol; solana._sdk_client = self.sdk.load
+        self.sdk.payer = PAYER; self.sdk.receipt = settlement()
+        self.assertTrue(solana.risk(MINT).paid)
+        self.assertEqual(self.sdk.signed_offer["accepts"], [self.sdk.offer["accepts"][1]])
+
+    def test_every_base_offer_check_precedes_key_loading_or_signing(self):
+        changes = [("network", "eip155:1"), ("payTo", BASE_PAYER), ("asset", BASE_PAYER), ("scheme", "upto"),
+                   ("amount", "10001"), ("amount", "0"), ("maxTimeoutSeconds", 301)]
+        for name, value in changes:
+            c = self.make(); self.evm[name] = value
+            self.refusal(lambda: c.risk(MINT))
+        for name, value in (("assetTransferMethod", "permit2"), ("paymentFlow", "upfront"), ("name", "wrong domain"),
+                            ("version", "1"), ("memo", "ignored?"), ("feePayer", FEE), ("recentBlockhash", FEE)):
+            c = self.make(); self.evm["extra"][name] = value
+            self.refusal(lambda: c.risk(MINT))
+        c = self.make(); self.sdk.offer["accepts"].append(copy.deepcopy(self.evm))
+        self.refusal(lambda: c.risk(MINT))
+
+    def test_base_board_uses_hmac_extra_without_svm_memo(self):
+        c = self.make(); helper = FakeSDK(); board_offer(helper, n=500, limit=500)
+        bound = helper.offer["accepts"][0]
+        self.evm["amount"] = "2500000"; self.sdk.receipt["amount"] = "2500000"
+        self.evm["extra"].update({k: v for k, v in bound["extra"].items() if k.startswith("hodlodds")})
+        answer = c.board(limit=500, max_price_usdc="2.5")
+        self.assertEqual(answer.payment["amount_usdc"], "2.5")
+        self.assertNotIn("memo", self.sdk.signed_offer["accepts"][0]["extra"])
+        self.assertEqual(self.sdk.spend_caps, ["$2.5", "$1"])
+        for field in ("hodloddsBoard", "hodloddsBoardSignature"):
+            c = self.make(); self.evm["extra"].update({k: v for k, v in bound["extra"].items() if k.startswith("hodlodds")})
+            self.evm["amount"] = "2500000"; self.evm["extra"].pop(field)
+            self.refusal(lambda: c.board(limit=500, max_price_usdc="2.5"))
+
+    def test_base_dynamic_cap_and_single_route_cap(self):
+        c = self.make()
+        self.refusal(lambda: c.risk(MINT, max_price_usdc="1.000001"))
+        c = self.make()
+        self.refusal(lambda: c.board(limit=500, max_price_usdc="2.500001"))
+        c = self.make(); helper = FakeSDK(); board_offer(helper, n=100, limit=100)
+        self.evm["amount"] = "500000"
+        self.evm["extra"].update({k: v for k, v in helper.offer["accepts"][0]["extra"].items() if k.startswith("hodlodds")})
+        self.refusal(lambda: c.board(limit=100, max_price_usdc=".499999"))
+
+    def test_base_200_without_receipt_and_paid_errors_never_retry(self):
+        for status, receipt in ((200, False), (409, False), (503, False), (409, True)):
+            c = self.make(responses=[challenge(), Response(status, {"PAYMENT-RESPONSE": "receipt"} if receipt else {})])
+            with self.assertRaises(client.HodlOddsError) as caught:
+                c.risk(MINT)
+            self.assertEqual(len(self.http.calls), 2); self.assertEqual(self.sdk.signs, 1)
+            self.assertIn("Reconcile", str(caught.exception)); self.assertIn("base-sepolia", str(caught.exception))
+            self.assertEqual(caught.exception.payment["transaction"], BASE_TX if receipt else None)
+
+    def test_base_mainnet_pin_explicit_and_checksum_enforced(self):
+        with patch.object(client, "_new_http") as http, patch.object(client, "_evm_address", return_value=False):
+            for recipient in (None, BASE_PAYTO.lower(), "0x" + "0" * 40):
+                with self.assertRaises(client.HodlOddsError):
+                    client.HodlOdds("https://example.com", network="base", pay_to=recipient)
+            http.assert_not_called()
+
 
 class CLITests(unittest.TestCase):
+    def setUp(self):
+        # An ambiguous paid CLI call saves a pending file; never into the real
+        # ~/.config/hodlodds/pending (reviewer, 2026-10-18: runs leaked there).
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        original = client.save_pending
+        saver = patch.object(client, "save_pending",
+                             lambda payment, directory=None: original(payment, Path(tmp.name).resolve() / "pending"))
+        saver.start(); self.addCleanup(saver.stop)
+
     def run_cli(self, args, responses, sdk=None, env=None):
         http, sdk = FakeHTTP(responses), sdk or FakeSDK()
         out, err = io.StringIO(), io.StringIO()
@@ -502,6 +684,14 @@ class CLITests(unittest.TestCase):
             self.assertEqual(code, 2); self.assertIn("explicit", err); self.assertEqual(http.calls, [])
         args = ["status", "--network=mainnet", "--pay-to=" + PAYTO]
         self.assertEqual(self.run_cli(args, [Response(200)])[0], 0)
+
+    def test_base_cli_requires_explicit_mainnet_pin_and_supports_testnet(self):
+        for network in ("base", "solana"):
+            code, _, _, http, _ = self.run_cli(["status"], [], env={"HODLODDS_NETWORK": network, "HODLODDS_PAY_TO": BASE_PAYTO})
+            self.assertEqual(code, 2); self.assertEqual(http.calls, [])
+        with patch.object(client, "_evm_address", return_value=True):
+            code, _, err, _, _ = self.run_cli(["status", "--network", "base-sepolia", "--pay-to", BASE_PAYTO], [Response(200)])
+        self.assertEqual(code, 0, err)
 
     def test_cli_invalid_amount_and_transport_errors_are_not_tracebacks(self):
         for args, replies in ((["status", "--max-price", "NaN"], []), (["status"], [OSError("DO_NOT_PRINT")])):
@@ -540,6 +730,44 @@ class CLITests(unittest.TestCase):
 
 
 class SDKIntegrationTests(unittest.TestCase):
+    def test_real_evm_sdk_signs_only_selected_base_board_offline(self):
+        try:
+            from eth_account import Account
+            from eth_account.messages import encode_typed_data
+            from x402.http import decode_payment_signature_header, encode_payment_required_header, encode_payment_response_header
+            from x402.schemas import PaymentRequired, SettleResponse
+            from x402.mechanisms.evm.eip712 import build_typed_data_for_signing
+            from x402.mechanisms.evm.types import ExactEIP3009Payload
+            from x402.mechanisms.evm.signers import EthAccountSigner
+        except ImportError:
+            self.skipTest("install x402[svm,evm]==2.25.0 for the real-EVM offline signing test")
+        payer = Account.create(); net = REAL_NETWORK_CONFIG("base-sepolia")
+        helper = FakeSDK(); board_offer(helper, n=500, limit=500)
+        selected = dict(helper.offer["accepts"][0], network=net["caip2"], asset=net["usdc"], payTo=BASE_PAYTO)
+        selected["extra"] = {k: v for k, v in selected["extra"].items() if k.startswith("hodlodds")}
+        selected["extra"].update(paymentFlow="authorization", name=net["name"], version=net["version"])
+        requirement = offer(); requirement["accepts"].append(selected)
+        receipt = {"success": True, "network": net["caip2"], "transaction": BASE_TX, "payer": payer.address, "amount": "2500000"}
+        transport = FakeHTTP([Response(402, {"PAYMENT-REQUIRED": encode_payment_required_header(PaymentRequired.model_validate(requirement))}),
+                              Response(200, {"PAYMENT-RESPONSE": encode_payment_response_header(SettleResponse.model_validate(receipt))})])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "throwaway.json"
+            path.write_text(json.dumps({"private_key": "0x" + bytes(payer.key).hex()})); path.chmod(0o600)
+            with patch.object(client, "_new_http", return_value=transport), patch.object(client, "_network_config", side_effect=REAL_NETWORK_CONFIG), \
+                    patch("socket.create_connection", side_effect=AssertionError("unexpected RPC")):
+                with client.HodlOdds("http://127.0.0.1:8010", network="base-sepolia", pay_to=BASE_PAYTO, keypair=path) as c:
+                    answer = c.board(limit=500, max_price_usdc="2.5")
+        self.assertTrue(answer.paid)
+        payload = decode_payment_signature_header(transport.calls[1][2]["PAYMENT-SIGNATURE"])
+        self.assertEqual(payload.accepted.network, net["caip2"])
+        self.assertEqual(payload.accepted.extra["hodloddsBoard"], selected["extra"]["hodloddsBoard"])
+        inner = ExactEIP3009Payload.from_dict(payload.payload)
+        self.assertEqual(inner.authorization.value, "2500000"); self.assertEqual(inner.authorization.to, BASE_PAYTO)
+        domain, types, _, message = build_typed_data_for_signing(inner.authorization, int(net["caip2"].split(":")[1]), net["usdc"], net["name"], net["version"])
+        domain = {"name": domain.name, "version": domain.version, "chainId": domain.chain_id, "verifyingContract": domain.verifying_contract}
+        signed = encode_typed_data(domain_data=domain, message_types=types, message_data=message)
+        self.assertEqual(Account.recover_message(signed, signature=inner.signature), payer.address)
+
     def test_pinned_sdk_codec_and_signature_with_all_rpc_mocked(self):
         self.real_sdk_payment()
 
@@ -576,7 +804,7 @@ class SDKIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             key = Path(tmp) / "throwaway.json"
             key.write_text(json.dumps(list(bytes(payer)))); key.chmod(0o600)
-            with patch.object(client, "_new_http", return_value=transport), \
+            with patch.object(client, "_new_http", return_value=transport), patch.object(client, "_network_config", side_effect=REAL_NETWORK_CONFIG), \
                     patch.object(ExactSvmScheme, "_get_client", return_value=object()), \
                     patch("x402.mechanisms.svm.exact.client.get_cached_mint_metadata",
                           return_value=SimpleNamespace(token_program=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), decimals=6)), \
