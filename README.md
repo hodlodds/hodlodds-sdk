@@ -31,7 +31,8 @@ You only pay for fresh, covered answers. "Not covered", "feed interrupted" and
 ## Install
 
 ```sh
-pip install "git+https://github.com/hodlodds/hodlodds-sdk"
+pip install hodlodds                                        # from PyPI
+pip install "git+https://github.com/hodlodds/hodlodds-sdk"  # or the latest main
 ```
 
 Python 3.10+. Dependencies: `httpx` and the official `x402[svm,evm]==2.25.0` SDK (pinned).
