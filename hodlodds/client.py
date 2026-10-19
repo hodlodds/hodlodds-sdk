@@ -18,10 +18,13 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import stat
 import sys
 import secrets
+import time
+from datetime import datetime, timezone
 from decimal import Decimal, DecimalException
 from importlib.metadata import version
 from pathlib import Path
@@ -372,7 +375,7 @@ class HodlOdds:
                     or any(c in k + v for c in "\r\n") or k.lower().startswith(("payment-", "x-payment"))
                     or k.lower() in ("host", "content-length", "transfer-encoding")):
                 raise HodlOddsError("access_headers contains an invalid or reserved payment/transport header")
-        headers["User-Agent"] = "hodlodds-python/0.2"
+        headers["User-Agent"] = "hodlodds-python/0.3"
         try:
             self.http = _new_http(timeout, headers)
         except Exception:
@@ -402,6 +405,22 @@ class HodlOdds:
         query = _board_query(limit, sort, filters)
         params = {"limit": query["limit"], "sort": query["sort"], **query["filters"]}
         return self._paid("/v1/board?" + urlencode(params), max_price_usdc, board_query=query)
+
+    def watch(self, mint, every_minutes=5, *, max_spend_usdc, max_calls=None,
+              alert_above=None, stop_on_stale=False):
+        """Closeable generator of Answers; estimate and spent_atomic live on the iterator."""
+        return Watch(self, "/v1/risk/" + self._mint(mint), every_minutes,
+                     max_spend_usdc, max_calls, alert_above, stop_on_stale)
+
+    def watch_board(self, every_minutes=5, *, max_spend_usdc, max_calls=None,
+                    alert_above=None, stop_on_stale=False, limit=50, sort="safest",
+                    max_price_usdc=None, **filters):
+        """Watch a board with the same query binding and price checks as board()."""
+        query = _board_query(limit, sort, filters)
+        params = {"limit": query["limit"], "sort": query["sort"], **query["filters"]}
+        return Watch(self, "/v1/board?" + urlencode(params), every_minutes,
+                     max_spend_usdc, max_calls, alert_above, stop_on_stale,
+                     max_price_usdc=max_price_usdc, board_query=query)
 
     def close(self):
         try:
@@ -598,7 +617,7 @@ class HodlOdds:
             reason = str(exc) if isinstance(exc, HodlOddsError) else 'redeem response unavailable; not retried'
             raise HodlOddsError(reason, response.status_code if response else None, payment=payment) from None
 
-    def _paid(self, path, max_price_usdc, board_query=None):
+    def _paid(self, path, max_price_usdc, board_query=None, *, _watch=None):
         maximum = BOARD_MAX_USDC if board_query is not None else HARD_MAX_USDC
         limit = self.max_atomic if max_price_usdc is None else _usdc(max_price_usdc, "max_price_usdc", maximum)
         url = self.base + path
@@ -624,6 +643,8 @@ class HodlOdds:
             raise
         except Exception:
             raise HodlOddsError("invalid PAYMENT-REQUIRED offer; nothing signed", 402) from None
+        if _watch is not None:
+            _watch.check_budget(amount)
         # Read the key only after all checks that do not need the payer address.
         sdk = self._sdk_client()
         if not self._address_check(sdk["payer"]) or self._same_address(sdk["payer"], self.pay_to):
@@ -650,6 +671,10 @@ class HodlOdds:
         payment = PendingPayment(payment, signature=signature, url=url, base=self.base)
         paid = None
         try:
+            if _watch is not None:
+                # Reserve the accepted amount before transport. An uncertain
+                # attempt is never refunded or retried by a watch.
+                _watch.spent_atomic += amount
             # Exactly one authorized HTTP attempt. A lost/error response does
             # not establish absence of settlement, even on normally free errors.
             paid = self._request(url, headers={"PAYMENT-SIGNATURE": signature}, timeout=self.paid_timeout)
@@ -679,8 +704,10 @@ class HodlOdds:
             if not receipt:
                 raise HodlOddsError("200 without PAYMENT-RESPONSE")
             return Answer(200, _json_object(paid), dict(payment))
-        except Exception as exc:
-            reason = str(exc) if isinstance(exc, HodlOddsError) else "invalid payment response"
+        except (Exception, KeyboardInterrupt, GeneratorExit) as exc:
+            reason = (str(exc) if isinstance(exc, HodlOddsError) else
+                      "authorized request interrupted" if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                      else "invalid payment response")
             if payment["success"] is False:
                 # Facilitator-declared failure: say so plainly, keep the reconcile facts.
                 raise HodlOddsError(reason + ". Not retried. Check %(amount_usdc)s USDC on %(network)s from %(payer)s "
@@ -695,9 +722,148 @@ class HodlOdds:
 
 def _fmt(atomic):
     try:
-        return format((Decimal(int(atomic)) / USDC_ATOMIC).normalize(), "f")
+        amount = int(atomic)
+        whole, fraction = divmod(abs(amount), 1000000)
+        return ("-" if amount < 0 else "") + str(whole) + ((".%06d" % fraction).rstrip("0") if fraction else "")
     except (TypeError, ValueError, DecimalException):
         return "?"
+
+
+class _WatchCapReached(Exception):
+    pass
+
+
+def _watch_wake(now, every_minutes):
+    period = every_minutes * 60
+    return (math.floor((now - 25) / period) + 1) * period + 25 + random.uniform(0, 5)
+
+
+class Watch:
+    """Iterator backed by a generator, with an estimate available before iteration.
+
+    max_calls counts paid-route calls (including free empty boards), not skipped
+    status checks. close() releases the generator; the caller owns the client.
+    """
+    def __init__(self, client, path, every_minutes, max_spend_usdc, max_calls,
+                 alert_above, stop_on_stale, max_price_usdc=None, board_query=None):
+        if type(every_minutes) is not int or not 1 <= every_minutes <= 60:
+            raise HodlOddsError("every_minutes must be an integer between 1 and 60")
+        if max_calls is not None and (type(max_calls) is not int or max_calls < 1):
+            raise HodlOddsError("max_calls must be a positive integer")
+        if type(stop_on_stale) is not bool:
+            raise HodlOddsError("stop_on_stale must be a boolean")
+        if alert_above is not None:
+            try:
+                if isinstance(alert_above, bool):
+                    raise ValueError()
+                alert_above = float(alert_above)
+                if not math.isfinite(alert_above) or not 0 <= alert_above <= 1:
+                    raise ValueError()
+            except (ValueError, TypeError, OverflowError):
+                raise HodlOddsError("alert_above must be a finite number between 0 and 1") from None
+        self.cap_atomic = _usdc(max_spend_usdc, "max_spend_usdc", Decimal("1e100"))
+        if max_price_usdc is not None:
+            _usdc(max_price_usdc, "max_price_usdc", BOARD_MAX_USDC if board_query else HARD_MAX_USDC)
+        self.client, self.path, self.every_minutes = client, path, every_minutes
+        self.max_calls, self.alert_above, self.stop_on_stale = max_calls, alert_above, stop_on_stale
+        self.max_price_usdc, self.board_query = max_price_usdc, board_query
+        self.spent_atomic, self.calls, self.cycle = 0, 0, 0
+        self.last_as_of, self.stop_reason = None, None
+        price = board_query["limit"] * BOARD_ATOMIC_PER_COIN if board_query else 10000
+        hourly = Decimal(price) * 60 / (1000000 * every_minutes)
+        self.estimate = {"price_per_call_usdc": _fmt(price),
+                         "calls_per_hour": format(Decimal(60) / every_minutes, "f"),
+                         "per_hour_usdc": format(hourly, "f"),
+                         "per_24h_usdc": format(hourly * 24, "f"),
+                         "cap_usdc": _fmt(self.cap_atomic)}
+        self._generator = self._run()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._generator)
+
+    def close(self):
+        self._generator.close()
+
+    def check_budget(self, amount):
+        if self.spent_atomic + amount > self.cap_atomic:
+            raise _WatchCapReached()
+
+    def _result(self, answer, reason=None):
+        answer.watch = {"cycle": self.cycle, "spent_usdc": _fmt(self.spent_atomic),
+                        "cap_usdc": _fmt(self.cap_atomic), "skipped_reason": reason,
+                        "utc": datetime.fromtimestamp(time.time(), timezone.utc).isoformat()}
+        rows = answer.data.get("rows", [answer.data.get("row", {})]) if reason is None else []
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise HodlOddsError("invalid watch answer rows; watch stopped", answer.status,
+                                answer.data, answer.payment)
+        answer.alerts = [row for row in rows
+                         if self.alert_above is not None
+                         and isinstance(row.get("p_crash_60m"), (int, float))
+                         and row["p_crash_60m"] >= self.alert_above]
+        answer.watch["alert"] = bool(answer.alerts)
+        return answer
+
+    @staticmethod
+    def _skip_reason(status, last_as_of):
+        if status.get("state") != "live":
+            return "feed " + str(status.get("state", "unknown"))
+        as_of = status.get("as_of")
+        if type(as_of) is not int or as_of < 0:
+            raise HodlOddsError("live status has no valid as_of; nothing paid")
+        if last_as_of is not None and as_of <= last_as_of:
+            return "unchanged as_of" if as_of == last_as_of else "older as_of"
+        return None
+
+    def _run(self):
+        try:
+            while True:
+                if self.max_calls is not None and self.calls >= self.max_calls:
+                    self.stop_reason = "max_calls reached"
+                    return
+                if self.spent_atomic >= self.cap_atomic:
+                    self.stop_reason = "spending cap reached"
+                    return
+                wake = _watch_wake(time.time(), self.every_minutes)
+                remaining = wake - time.time()
+                while remaining > 0:
+                    time.sleep(min(60, remaining))
+                    remaining = wake - time.time()
+                self.cycle += 1
+                status = self.client.status()
+                reason = self._skip_reason(status, self.last_as_of)
+                if reason in ("unchanged as_of", "older as_of"):
+                    time.sleep(10)
+                    status = self.client.status()
+                    reason = self._skip_reason(status, self.last_as_of)
+                if reason:
+                    yield self._result(Answer(None, status), reason)
+                    if self.stop_on_stale and status.get("state") != "live":
+                        self.stop_reason = reason
+                        return
+                    continue
+                try:
+                    answer = self.client._paid(self.path, self.max_price_usdc,
+                                               board_query=self.board_query, _watch=self)
+                except _WatchCapReached:
+                    self.stop_reason = "spending cap reached"
+                    yield self._result(Answer(None, status), self.stop_reason)
+                    return
+                self.calls += 1
+                if answer.paid:
+                    as_of = answer.data.get("as_of")
+                    if type(as_of) is not int or as_of < 0:
+                        raise HodlOddsError("paid answer has no valid as_of; watch stopped",
+                                            answer.status, answer.data, answer.payment)
+                    self.last_as_of = as_of
+                yield self._result(answer)
+        except KeyboardInterrupt:
+            # Interrupts after authorization are converted to payment errors by
+            # _paid. Only unsigned requests and between-cycle waits end here.
+            self.stop_reason = "interrupted"
+            return
 
 
 def _body(response):
@@ -717,9 +883,46 @@ def _json_object(response):
         raise HodlOddsError("response is not a JSON object", response.status_code) from None
 
 
+def _watch_print(answer, as_json=False, board=False):
+    if as_json:
+        print(json.dumps(dict(answer.data, watch=answer.watch)), flush=True)
+        return
+    watch = answer.watch
+    prefix = "%s as_of=%s" % (watch["utc"], answer.data.get("as_of"))
+    spend = "%s / %s USDC" % (watch["spent_usdc"], watch["cap_usdc"])
+    if watch["skipped_reason"]:
+        detail = "skipped: " + watch["skipped_reason"]
+    elif board:
+        rows = answer.data.get("rows", [])
+        detail = "board %d rows, %d alerts" % (len(rows), len(answer.alerts))
+        if answer.alerts:
+            detail += " ALERT"
+    else:
+        detail = _watch_row(answer.data.get("row", {}))
+        if answer.alerts:
+            detail += " ALERT"
+    print("%s %s spent %s" % (prefix, detail, spend), flush=True)
+    if board and not watch["skipped_reason"]:
+        for row in answer.alerts:
+            print("  %s %s ALERT" % (row.get("mint", "?"), _watch_row(row)), flush=True)
+
+
+def _watch_row(row):
+    probability = row.get("p_crash_60m")
+    if not isinstance(probability, (int, float)):
+        odds = "?"
+    elif probability < 0.001:
+        odds = "<0.1%"  # never print a low score as 0.0%: low is not zero
+    else:
+        odds = "%.1f%%" % (probability * 100)
+    confidence = row.get("confidence")
+    level = confidence.get("level", "unknown") if isinstance(confidence, dict) else "unknown"
+    return "odds=%s confidence=%s" % (odds, level)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="HodlOdds x402 client")
-    p.add_argument("command", choices=["status", "meta", "risk", "last", "board", "redeem"])
+    p.add_argument("command", choices=["status", "meta", "risk", "last", "board", "redeem", "watch"])
     p.add_argument("mint", nargs="?")
     p.add_argument("--base-url", default=os.environ.get("HODLODDS_BASE_URL", "https://api.hodlodds.com"))
     p.add_argument("--network", default=os.environ.get("HODLODDS_NETWORK", "devnet"), choices=sorted(NETWORKS))
@@ -737,18 +940,34 @@ def main(argv=None):
     p.add_argument("--max-age", dest="max_age_min")
     p.add_argument("--min-trades", dest="min_trades_5", type=int)
     p.add_argument("--min-confidence", choices=("high", "medium", "low"))
+    p.add_argument("--board", action="store_true", help="watch a board instead of a mint")
+    p.add_argument("--every", type=int, default=5, help="watch interval in minutes, 1..60")
+    p.add_argument("--max-spend", help="required watch spending cap in USDC")
+    p.add_argument("--max-calls", type=int, help="maximum paid-route calls; skips do not count")
+    p.add_argument("--alert-above", help="alert at or above these odds, 0..1")
+    p.add_argument("--stop-on-stale", action="store_true")
+    p.add_argument("--json", action="store_true", help="watch results as JSON Lines")
     args = list(sys.argv[1:] if argv is None else argv)
     a = p.parse_args(args)
     if a.command in ("risk", "last") and not a.mint:
         p.error(a.command + " needs a mint address")
     if a.command == "redeem" and not a.mint:
         p.error("redeem needs a pending payment file")
-    if a.command not in ("risk", "last", "redeem") and a.mint:
+    if a.command not in ("risk", "last", "redeem", "watch") and a.mint:
         p.error(a.command + " does not take a mint")
     explicit = lambda flag: any(v == flag or v.startswith(flag + "=") for v in args)
+    if a.command == "watch":
+        if a.max_spend is None:
+            p.error("watch requires --max-spend")
+        if bool(a.mint) == a.board:
+            p.error("watch requires either a mint address or --board")
+    elif any(explicit(flag) for flag in ("--board", "--every", "--max-spend", "--max-calls",
+                                        "--alert-above", "--stop-on-stale", "--json")):
+        p.error("watch options can be used only with watch")
+    is_board = a.command == "board" or (a.command == "watch" and a.board)
     board_flags = ("--limit", "--sort", "--max-risk", "--min-risk", "--min-liquidity", "--min-age",
                    "--max-age", "--min-trades", "--min-confidence")
-    if a.command != "board" and any(explicit(flag) for flag in board_flags):
+    if not is_board and any(explicit(flag) for flag in board_flags):
         p.error("board filters and sorting can be used only with board")
     if a.command != "redeem" and a.network in ("mainnet", "solana", "base") and not (explicit("--network") and explicit("--pay-to")):
         p.error("mainnet requires explicit --network and --pay-to; environment defaults are not enough")
@@ -757,7 +976,27 @@ def main(argv=None):
         if pending is not None:
             a.base_url, a.network, a.pay_to = pending._base, pending['network'], pending['pay_to']
         with HodlOdds(a.base_url, keypair=a.keypair, network=a.network, pay_to=a.pay_to,
-                      max_price_usdc="0.01" if a.command == "board" else a.max_price, rpc_url=a.rpc_url) as client:
+                      max_price_usdc="0.01" if is_board else a.max_price, rpc_url=a.rpc_url) as client:
+            if a.command == "watch":
+                options = dict(every_minutes=a.every, max_spend_usdc=a.max_spend, max_calls=a.max_calls,
+                               alert_above=a.alert_above, stop_on_stale=a.stop_on_stale)
+                if a.board:
+                    filters = {name: getattr(a, name) for name in BOARD_FILTERS if getattr(a, name) is not None}
+                    watching = client.watch_board(limit=a.limit, sort=a.sort, max_price_usdc=a.max_price,
+                                                  **options, **filters)
+                else:
+                    watching = client.watch(a.mint, **options)
+                print("Watch estimate: %(price_per_call_usdc)s USDC/call × %(calls_per_hour)s calls/h = "
+                      "%(per_hour_usdc)s USDC/h, %(per_24h_usdc)s USDC/24h; cap %(cap_usdc)s USDC"
+                      % watching.estimate, file=sys.stderr, flush=True)
+                try:
+                    for answer in watching:
+                        _watch_print(answer, a.json, a.board)
+                finally:
+                    watching.close()
+                if watching.stop_reason:
+                    print("Watch stopped: " + watching.stop_reason, file=sys.stderr)
+                return 0
             if a.command in ("status", "meta"):
                 print(json.dumps(getattr(client, a.command)(), indent=2))
                 return 0
@@ -783,6 +1022,8 @@ def main(argv=None):
         if e.body is not None and e.payment is None:
             print(json.dumps(e.body, indent=2), file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":
