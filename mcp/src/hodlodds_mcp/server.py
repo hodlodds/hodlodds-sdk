@@ -12,7 +12,7 @@ from threading import Lock
 from typing import Any, Literal
 
 import anyio
-from hodlodds import HodlOdds, HodlOddsError
+from hodlodds import HodlOdds, HodlOddsError, PriceLimitError
 from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, TextContent
 
@@ -40,6 +40,162 @@ RECONCILE = (
     "A restart starts a new process budget."
 )
 
+# Fixed JSON `error` texts the HodlOdds API can return to a client. Kept equal to
+# tests/server_messages.json, which is exported from the server source; a test
+# fails when the two differ. Anything else is never echoed.
+SERVER_ERRORS = frozenset((
+    "Answer freshness changed; request again",
+    "Board answer exceeds 4 MiB; use a smaller limit",
+    "Board payment amount changed; request again",
+    "Board payment does not match the normalized query and priced count; request again",
+    "Duplicate board parameter: chain",
+    "Duplicate board parameter: include_crashed",
+    "Duplicate board parameter: limit",
+    "Duplicate board parameter: max_age_min",
+    "Duplicate board parameter: max_risk",
+    "Duplicate board parameter: min_age_min",
+    "Duplicate board parameter: min_confidence",
+    "Duplicate board parameter: min_liquidity_sol",
+    "Duplicate board parameter: min_risk",
+    "Duplicate board parameter: min_trades_5",
+    "Duplicate board parameter: mints",
+    "Duplicate board parameter: platform",
+    "Duplicate board parameter: sort",
+    "Duplicate chain value; see /v1/markets",
+    "Duplicate mints are not allowed",
+    "Duplicate parameter: chain",
+    "Duplicate parameter: platform",
+    "Duplicate platform value; see /v1/markets",
+    "Feed interrupted",
+    "Feed unavailable",
+    "Final freshness check unavailable",
+    "Invalid mint",
+    "Invalid priced board count",
+    "Last known odds too old",
+    "Latest snapshot changed; request again",
+    "Mint is not currently covered",
+    "No redeemable payment found; no settlement attempted",
+    "Outside validated SOL coverage",
+    "Paid service is not available",
+    "Payment already delivered or redeem expired",
+    "Payment already redeemed",
+    "Payment already redeemed or redeem expired",
+    "Payment already submitted; reconcile the original payment before retrying",
+    "Payment capacity check unavailable",
+    "Payment header too large",
+    "Payment recovery check unavailable",
+    "Payment replay check unavailable",
+    "Payment required",
+    "Payment service unavailable",
+    "Payment service unavailable; reconcile any submitted authorization",
+    "Payment settled; delivery persistence unavailable; redeem after reconciliation",
+    "Public beta is not enabled",
+    "Rate limit exceeded",
+    "Redeem requires the original board query",
+    "Request refused before settlement",
+    "Request too large",
+    "Service temporarily unavailable",
+    "Snapshot refresh in progress; request again",
+    "Template paths provide discovery only",
+    "Too many concurrent paid requests",
+    "Too many invalid payments; slow down",
+    "Use a real mint to pay for an answer",
+    "busy",
+    "chain must contain 1..10 non-empty values; see /v1/markets",
+    "include_crashed must be true or false",
+    "limit is too large",
+    "limit must be 1..100",
+    "limit must be 10..500",
+    "limit must be an integer",
+    "matches changed; request again",
+    "max_age_min must be a finite non-negative number",
+    "max_age_min must be a finite number",
+    "max_risk must be a finite non-negative number",
+    "max_risk must be a finite number",
+    "max_risk must be between 0 and 1",
+    "min_age_min must be a finite non-negative number",
+    "min_age_min must be a finite number",
+    "min_age_min must not exceed max_age_min",
+    "min_confidence must be high, medium or low",
+    "min_liquidity_sol must be a finite non-negative number",
+    "min_liquidity_sol must be a finite number",
+    "min_risk must be a finite non-negative number",
+    "min_risk must be a finite number",
+    "min_risk must be between 0 and 1",
+    "min_risk must not exceed max_risk",
+    "min_trades_5 is too large",
+    "min_trades_5 must be 0..9223372036854775807",
+    "min_trades_5 must be an integer",
+    "mints must contain 1..100 valid Solana mint addresses",
+    "payment is being verified on-chain",
+    "platform must contain 1..10 non-empty values; see /v1/markets",
+    "platform outside the given chains; see /v1/markets",
+    "sort must be one of: lowest_risk, safest, riskiest, liquidity, newest, active",
+    "this payment never settled; request a new offer",
+))
+# Texts whose tail names a rejected input or a server list: only this prefix is shown.
+SERVER_ERROR_TEMPLATES = (
+    "Unknown board parameter: ",
+    "Unknown parameter: ",
+    "chain not available; see /v1/markets. Valid values: ",
+    "platform not available; see /v1/markets. Valid values: ",
+)
+# The SDK's own fixed refusals, raised before any authorization is signed
+# (argument checks, offer checks, key loading). Kept in sync with the SDK
+# source by tests/test_refusals.py.
+CLIENT_REFUSALS = frozenset((
+    "mint must be a Solana address",
+    "mints must contain 1..100 valid Solana mint addresses",
+    "duplicate mints are not allowed",
+    "limit must be an integer between 10 and 500",
+    "limit must be an integer between 1 and 100",
+    "sort must be one of: lowest_risk, safest, riskiest, liquidity, newest, active",
+    "include_crashed must be a boolean",
+    "min_confidence must be high, medium or low",
+    "min_trades_5 must be an integer between 0 and 9223372036854775807",
+    "min_risk must be a finite number between 0 and 1",
+    "max_risk must be a finite number between 0 and 1",
+    "min_liquidity_sol must be a finite number at least 0",
+    "min_age_min must be a finite number at least 0",
+    "max_age_min must be a finite number at least 0",
+    "min_risk must not exceed max_risk",
+    "min_age_min must not exceed max_age_min",
+    "chain must contain 1..10 non-empty values",
+    "chain not available; see /v1/markets",
+    "duplicate chain value",
+    "platform must contain 1..10 non-empty values",
+    "platform not available; see /v1/markets",
+    "duplicate platform value",
+    "only x402 v2 offers are accepted",
+    "invalid payment options",
+    "expected one payment option matching the configured network and pinned pay_to",
+    "only exact USDC payments are accepted",
+    "server payTo differs from the pinned pay_to address",
+    "price is invalid or above your USDC limit",
+    "only authorization payment flow is accepted",
+    "payment timeout must be between 1 and 300 seconds",
+    "a valid facilitator feePayer is required",
+    "invalid or oversized payment memo (maximum 32 bytes)",
+    "invalid payment blockhash",
+    "only EIP-3009 exact USDC authorizations are accepted; Permit2 is disabled",
+    "USDC signing domain differs from the pinned SDK",
+    "Solana transaction fields are not accepted in a Base offer",
+    "board offer does not match the requested query and per-coin price",
+    "board offer is missing its server binding signature",
+    "board payment memo does not bind the requested query and count",
+    "install the pinned x402[svm,evm]==2.25.0 SDK",
+    "pinned SDK network/USDC constants unavailable; install x402[svm,evm]==2.25.0",
+    "a keypair file is required for paid answers",
+    "pinned SDK network constants changed",
+    "cannot load key: use a regular non-symlink file, mode 0600, at most 4096 bytes",
+    "cannot load key: use a regular non-symlink solana-keygen file, mode 0600, and installed SDK dependencies",
+    "cannot load EVM key: use a regular non-symlink 0600 hex/JSON private-key file and installed x402[evm] dependencies",
+    "cannot initialize payment SDK; no authorization was sent",
+    "payer and payTo must be different wallets",
+    "payer must differ from the facilitator fee payer",
+    "authorization construction failed; nothing sent and not retried",
+))
+
 
 def atomic(value, name):
     """Parse decimal strings without float or Decimal-context rounding."""
@@ -55,6 +211,11 @@ def atomic(value, name):
 def usdc(value):
     whole, fraction = divmod(value, 1_000_000)
     return f"{whole}.{fraction:06d}"
+
+
+def plain(value):
+    """0.05 rather than 0.050000; for messages only."""
+    return usdc(value).rstrip("0").rstrip(".")
 
 
 @dataclass(frozen=True)
@@ -141,31 +302,30 @@ def error_details(exc):
     if body.get("code") == "offer_changed":
         result["server_code"] = "offer_changed"
     message = body.get("error")
-    fixed = {
-        "matches changed; request again", "Board offer changed; request again",
-        "Board payment amount changed; request again",
-        "Invalid mint", "Mint is not currently covered", "Outside validated SOL coverage",
-        "Feed interrupted", "Last known odds too old", "Paid service is not available",
-        "Payment required", "Payment service unavailable", "Payment replay check unavailable",
-        "Payment already submitted; reconcile the original payment before retrying",
-        "Payment header too large", "Rate limit exceeded", "Server busy",
-        "No redeemable payment found", "Final freshness check unavailable",
-        "Answer freshness changed; request again", "include_crashed must be true or false",
-        "min_confidence must be high, medium or low", "Duplicate mints are not allowed",
-        "mints must contain 1..100 valid Solana mint addresses",
-        "sort must be one of: lowest_risk, safest, riskiest, liquidity, newest, active",
-    }
-    fields = ("limit", "min_risk", "max_risk", "min_liquidity_sol", "min_age_min",
-              "max_age_min", "min_trades_5")
-    suffixes = (" must be an integer", " is too large", " must be 10..500",
-                " must be 1..100", " must be 0..9223372036854775807",
-                " must be a finite number", " must be a finite non-negative number",
-                " must be between 0 and 1")
-    fixed.update(name + tail for name in fields for tail in suffixes)
-    fixed.update(("min_risk must not exceed max_risk", "min_age_min must not exceed max_age_min"))
-    if isinstance(message, str) and message in fixed:
-        result["server_error"] = message
+    if isinstance(message, str):
+        if message in SERVER_ERRORS:
+            result["server_error"] = message
+        else:
+            prefix = next((t for t in SERVER_ERROR_TEMPLATES if message.startswith(t)), None)
+            if prefix is not None:
+                result["server_error"] = prefix.removesuffix(": ").removesuffix(". Valid values")
     return result
+
+
+def client_refusal(exc, *, board, max_atomic):
+    """Fixed text for a refusal the SDK made before signing; None for anything else."""
+    if not isinstance(exc, HodlOddsError) or exc.status is not None or exc.payment is not None:
+        return None
+    if isinstance(exc, PriceLimitError):
+        price, limit = exc.price_atomic, exc.limit_atomic
+        what = "This board" if board else "This answer"
+        hard_cap = 2_500_000 if board else 1_000_000
+        if limit == max_atomic and price <= hard_cap:
+            return (f"{what} costs {plain(price)} USDC but HODLODDS_MAX_PRICE_USDC is {plain(limit)}; "
+                    f"raise it to at least {plain(price)}.")
+        return f"{what} costs more than the client hard cap of {plain(hard_cap)} USDC; nothing was signed."
+    message = str(exc)
+    return message if message in CLIENT_REFUSALS else None
 
 
 def summary(p):
@@ -204,7 +364,7 @@ def odds_row(row):
     known = {"mint", "p_crash_60m", "summary", "confidence", "kind", "band", "resq_sol", "age_min",
              "ret_5", "ret_60", "dd_60", "trades_5", "symbol", "name", "image_uri",
              "chain", "chain_name", "platform", "market_status", "asset",
-             "already_crashed", "note", "alert"}
+             "already_crashed", "crashed_within_24h", "last_crash_as_of", "note", "alert"}
     if row.keys() - known:
         output["warning"] = "Additional source row fields are included; their meaning has not been interpreted."
     return output
@@ -256,7 +416,7 @@ class Service:
                 common.update({key: data[key] for key in (
                     "schema", "covered", "definition", "coverage", "model", "model_id", "model_hashes",
                     "stale", "age_s", "freshness", "horizon_remaining_s",
-                    "sort", "filters", "defaults_applied", "limit", "returned", "total_matches",
+                    "sort", "filters", "defaults_applied", "excluded_by_defaults", "limit", "returned", "total_matches",
                     "price_usdc", "unit_price_usdc") if key in data})
                 common.update(payment=receipt(answer.payment), **self.ledger.fields())
                 if board:
@@ -283,6 +443,11 @@ class Service:
                     self.ledger.paused = receipt(payment)
                     return result(error="payments_paused", message=RECONCILE,
                                   payment=self.ledger.paused, **error_details(exc), **self.ledger.fields())
+                refusal = client_refusal(exc, board=board, max_atomic=self.config.max_atomic) if answer is None else None
+                if refusal is not None:
+                    return result(error="client_refused", message=refusal,
+                                  detail="Refused locally before signing; nothing was signed or charged.",
+                                  http_status=None, payment=None, **self.ledger.fields())
                 return result(error="paid_request_failed", message="Request refused or unavailable; no payment charged.",
                               **error_details(exc),
                               payment=receipt(payment), **self.ledger.fields())
@@ -328,7 +493,7 @@ def create_server():
         async def last_known(mint: str, chain: str | list[str] | None = None, platform: str | list[str] | None = None) -> dict[str, Any]:
             return await anyio.to_thread.run_sync(partial(service.paid, partial(service.client.last, mint, chain=chain, platform=platform)))
 
-        @server.tool(description="Paid ranked covered Solana tokens or a watchlist of 1..100 distinct mints, with omitted-mint reasons, receipt and process spend. Price is 0.005 USDC per delivered row. lowest_risk (alias safest) defaults to min_trades_5=3 and include_crashed=false; explicit filters override these defaults, and watchlists get neither default.")
+        @server.tool(description="Paid ranked covered Solana tokens or a watchlist of 1..100 distinct mints, with omitted-mint reasons, receipt and process spend. Price is 0.005 USDC per delivered row; HODLODDS_MAX_PRICE_USDC must cover the total. lowest_risk (alias safest) defaults to min_trades_5=3, min_liquidity_sol=5 and include_crashed=false (excludes crashes in the last hour or the last 24 hours); explicit filters override these defaults, and watchlists get none of them.")
         async def board(
             limit: int | None = None,
             sort: Literal["lowest_risk", "safest", "riskiest", "liquidity", "newest", "active"] = "lowest_risk",

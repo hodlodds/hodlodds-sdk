@@ -270,9 +270,15 @@ async def test_watchlist_and_filters(api):
 async def test_board_cap_and_binding_before_signing(api):
     api.rows = 3
     async with session(create_server()) as client:
-        assert (await call(client, "board", limit=10))["error"] == "paid_request_failed"
+        data = await call(client, "board", limit=10)
+        assert data["error"] == "client_refused" and data["http_status"] is None
+        assert data["message"] == ("This board costs 0.015 USDC but HODLODDS_MAX_PRICE_USDC is 0.01; "
+                                   "raise it to at least 0.015.")
+        assert data["payment"] is None and data["spent_atomic"] == 0
         api.rows, api.invalid_binding = 1, True
-        assert (await call(client, "board", mints=[MINT]))["error"] == "paid_request_failed"
+        data = await call(client, "board", mints=[MINT])
+        assert data["error"] == "client_refused"
+        assert data["message"] == "board offer does not match the requested query and per-coin price"
     assert api.signs == api.loads == 0
 
 
@@ -404,7 +410,8 @@ async def test_market_filters_pass_through_and_validate(api, tool, args):
         assert {"chain", "platform"} <= set(tools[tool].input_schema["properties"])
         before = len(api.requests)
         data = await call(client, tool, **args, chain="robinhood")
-        assert data["error"] == "paid_request_failed"
+        assert data["error"] == "client_refused"
+        assert data["message"] == "chain not available; see /v1/markets"
         assert len(api.requests) == before and api.signs == 0
         data = await call(client, tool, **args, chain=["SOLANA"], platform="PUMP.FUN")
         assert "error" not in data
@@ -454,7 +461,7 @@ async def test_last_known_freshness_and_shared_budget(api, monkeypatch):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("variable,value,expected", [
-    ("HODLODDS_MAX_PRICE_USDC", "0.001999", "paid_request_failed"),
+    ("HODLODDS_MAX_PRICE_USDC", "0.001999", "client_refused"),
     ("HODLODDS_SESSION_BUDGET_USDC", "0.001999", "budget_exhausted"),
 ])
 async def test_last_known_limits_before_key_access(api, monkeypatch, variable, value, expected):
@@ -501,9 +508,10 @@ async def test_all_documented_evidence_survives_without_unknown_warning(api, too
             "historical_observed": .0133, "basis": "Historical weekly refits"}
     confidence = {"level": "low", "reasons": ["historical under-prediction"], "band": band,
                   "basis": "Historical weekly refits", "direction": "historically under-predicted"}
-    note = ("This token already fell 90% or more within the last hour; a low number now means "
-            "little is left to fall, not that it is safe.")
+    note = ("This token already fell 90% or more from its high of the last 60 minutes. The odds cover "
+            "a further 90% drop from the current price; they are not a recovery or safety signal.")
     api.row_fields = {"confidence": confidence, "band": band, "already_crashed": True,
+                      "crashed_within_24h": True, "last_crash_as_of": 1799999940,
                       "note": note, "alert": False, "dd_60": -.99, "symbol": "TEST",
                       "name": "Example token", "resq_sol": 120, "age_min": 1440,
                       "ret_5": -.95, "ret_60": -.99, "trades_5": 3, "kind": "sol",
@@ -515,7 +523,7 @@ async def test_all_documented_evidence_survives_without_unknown_warning(api, too
     if tool == "board":
         api.answer_fields.update(sort="lowest_risk", total_matches=37, returned=1, limit=1,
                                  filters={"include_crashed": True}, defaults_applied={},
-                                 unit_price_usdc="0.005", price_usdc="0.005")
+                                 excluded_by_defaults=0, unit_price_usdc="0.005", price_usdc="0.005")
     async with session(create_server()) as client:
         data = await call(client, tool, **args)
     row = data["rows"][0] if tool == "board" else data
@@ -634,3 +642,46 @@ async def test_unsigned_board_offer_refresh_stops_once_without_spending_or_pausi
 def test_server_error_allowlist_never_echoes_rejected_secrets(body, expected):
     exc = sdk.HodlOddsError(SECRET + SIGNED, status=400, body=body)
     assert error_details(exc) == {"http_status": 400, **expected}
+
+
+@pytest.mark.anyio
+async def test_price_cap_refusal_names_the_variable_and_amount(api):
+    api.rows = 10
+    async with session(create_server()) as client:
+        data = await call(client, "board", limit=10)
+    assert data["error"] == "client_refused" and data["http_status"] is None
+    assert data["message"] == "This board costs 0.05 USDC but HODLODDS_MAX_PRICE_USDC is 0.01; raise it to at least 0.05."
+    assert data["detail"] == "Refused locally before signing; nothing was signed or charged."
+    assert data["spent_atomic"] == 0 and data["payment"] is None
+    assert len(api.requests) == 1 and api.signs == api.loads == 0
+
+
+@pytest.mark.anyio
+async def test_invalid_arguments_are_refused_with_fixed_sdk_text_before_any_request(api):
+    async with session(create_server()) as client:
+        data = await call(client, "board", limit=5)
+        assert data["error"] == "client_refused" and data["message"] == "limit must be an integer between 10 and 500"
+        data = await call(client, "board", mints=[MINT, MINT])
+        assert data["message"] == "duplicate mints are not allowed"
+        data = await call(client, "board", min_risk=0.5, max_risk=0.1)
+        assert data["message"] == "min_risk must not exceed max_risk"
+        data = await call(client, "crash_odds", mint=SECRET)
+        assert data["error"] == "client_refused" and data["message"] == "mint must be a Solana address"
+    assert api.requests == [] and api.signs == api.loads == 0
+
+
+@pytest.mark.anyio
+async def test_defaults_explanations_and_unknown_memory_pass_through(api):
+    api.row_fields = {"already_crashed": False, "crashed_within_24h": None, "last_crash_as_of": None}
+    api.answer_fields = {"filters": {"min_trades_5": 3, "min_liquidity_sol": 5, "include_crashed": False},
+                         "defaults_applied": {"min_trades_5": 3, "min_liquidity_sol": 5, "include_crashed": False,
+                                              "reason": "Low-risk discovery applies the omitted filters shown here; "
+                                                        "recent-crash memory unavailable."},
+                         "excluded_by_defaults": 12, "total_matches": 1}
+    async with session(create_server()) as client:
+        data = await call(client, "board", limit=10)
+    for name, value in api.answer_fields.items():
+        assert data[name] == value
+    row = data["rows"][0]
+    assert row["crashed_within_24h"] is None and row["last_crash_as_of"] is None
+    assert "warning" not in row and "warning" not in data

@@ -1,12 +1,12 @@
 {
   "name": "com.hodlodds/hodlodds-mcp",
   "description": "Local crash-odds tools with free market discovery and bounded x402 USDC payments on Solana or Base.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "hodlodds-mcp",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "transport": {
         "type": "stdio"
       },
@@ -31,7 +31,7 @@
         },
         {
           "name": "HODLODDS_MAX_PRICE_USDC",
-          "description": "Per-call USDC cap",
+          "description": "Per-call USDC cap; a board costs 0.005 per delivered row (0.05 for 10 rows), so raise it for boards",
           "default": "0.01"
         },
         {

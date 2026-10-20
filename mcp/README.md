@@ -17,7 +17,7 @@ hodlodds-mcp
 uvx hodlodds-mcp
 ```
 
-Python 3.11+ is required. Dependencies are `hodlodds>=0.3.1,<0.4` and
+Python 3.11+ is required. Dependencies are `hodlodds>=0.3.2,<0.4` and
 `mcp>=2.3,<3`. The HodlOdds client supplies its pinned x402 dependencies. This
 package starts a local process, not an HTTP MCP endpoint. Stdout is reserved
 for MCP protocol messages.
@@ -51,12 +51,17 @@ its length and explicit limits are 1–100. Only returned coins are charged.
 odds. Probability filters use 0–1; confidence is `high`, `medium` or `low`.
 
 For `lowest_risk`/`safest`, omitted filters default server-side to
-`min_trades_5=3` and `include_crashed=false`. Explicit values override them,
-including `min_trades_5=0` and `include_crashed=true`. Watchlists get **neither
-default**: your crashed holdings stay visible and flagged unless explicitly
-filtered out. The offer binds the client's parameters without these defaults;
-the server applies them deterministically when selecting and pricing rows.
-Answers retain `filters`, `defaults_applied` and `total_matches`.
+`min_trades_5=3`, `min_liquidity_sol=5` and `include_crashed=false`; the crash
+filter excludes both `already_crashed` and `crashed_within_24h` rows. Explicit
+values override them, including `min_trades_5=0`, `min_liquidity_sol=0` and
+`include_crashed=true`. Watchlists get **none of these defaults**: your crashed
+holdings stay visible and flagged unless explicitly filtered out. The offer
+binds the client's parameters without these defaults; the server applies them
+deterministically when selecting and pricing rows. Answers retain `filters`,
+`defaults_applied`, `excluded_by_defaults` (rows removed only by the defaults,
+before the limit) and `total_matches`.
+
+The lowest odds are usually the least-traded tokens; the default filters remove most inactive or recently collapsed tokens, not all.
 
 `crash_odds`, `last_known`, `board` and `coverage` accept optional `chain` and `platform`
 strings, comma-separated strings or lists. Currently use `chain="solana"`
@@ -67,14 +72,19 @@ markets and payment networks are separate choices.
 
 Every result includes “Odds, not guarantees. Not financial advice.” Errors
 have MCP `isError: true`, a structured error code and `http_status` when known.
-Recognized public server messages are exposed as `server_error` and
+`client_refused` means the client refused locally before signing: an invalid
+argument, an offer that failed a check, a missing or unreadable key, or a price
+above `HODLODDS_MAX_PRICE_USDC`. Its `message` is the client's fixed refusal
+text, for example “This board costs 0.05 USDC but HODLODDS_MAX_PRICE_USDC is
+0.01; raise it to at least 0.05.” Its `http_status` is null; nothing was signed
+or charged. Recognized public server messages are exposed as `server_error` and
 `server_code` (such as `offer_changed`); arbitrary rejected content is not
 echoed. As in 0.1.0, `confidence` remains the level string:
 `high`, `medium`, `low`, or `missing`. The new `confidence_detail` field
 retains the full server object, including `reasons` and its band evidence
 (an empty object when absent). The row's `band` evidence also passes through.
-Model IDs/hashes, `alert` when supplied, `already_crashed` and `note` also pass
-through. Only undocumented row fields add an extra-fields warning.
+Model IDs/hashes, `alert` when supplied, `already_crashed`,
+`crashed_within_24h`, `last_crash_as_of` and `note` also pass through. Only undocumented row fields add an extra-fields warning.
 Receipts contain public payment details, not signed
 authorizations or key contents. Spending is tracked in integer atomic USDC;
 displayed USDC amounts are exact decimal strings.
@@ -94,8 +104,8 @@ or spending limits. Set these in the MCP process environment:
 | `HODLODDS_SESSION_BUDGET_USDC` | Required when a key is set; positive plain decimal with at most six fractional digits. No default budget. Resets on process restart. |
 
 The default per-call cap can buy at most two delivered board rows. A larger
-offer is refused before key access; the cap does not trim an answer down to
-two coins. Set `0.50` explicitly for up to 100 delivered rows, for example.
+offer is refused before key access with `client_refused`, which names the
+amount to set; the cap does not trim an answer down to two coins. Set `0.50` explicitly for up to 100 delivered rows, for example.
 The accepted offer amount, not the requested limit, determines the budget debit.
 
 **Read-only mode:** omit the key and session budget. The registered tools are
@@ -163,13 +173,15 @@ indicate success or a transaction. A conflicting or malformed receipt remains
 uncertain. Confirmed free refusals refund the reservation, return an error and
 leave payments enabled.
 
-For a board `409` with `code: "offer_changed"`, the SDK can request a new
-offer once **before signing only**, with the same query and repeated price
-and budget checks. A signed request is never retried automatically. After signing,
-a `409` with `code: "offer_changed"` and `HodlOdds-Charged: no` (without a conflicting
-receipt) means nothing was charged, but the client must call again; the SDK never
-re-signs on its own. A second automatic authorization could be settled twice
-if a server misbehaved. The free refusal releases the budget reservation.
+A board `409` with `code: "offer_changed"` is returned by the current API
+only after signing. A signed request is never retried automatically. After
+signing, a `409` with `code: "offer_changed"` and `HodlOdds-Charged: no`
+(without a conflicting receipt) means nothing was charged, but the client must
+call again; the SDK never re-signs on its own. A second automatic authorization
+could be settled twice if a server misbehaved. The free refusal releases the
+budget reservation; call `board` again for a new offer. As a safeguard only, the
+SDK can request a new offer once **before signing only**, with the same query
+and repeated price and budget checks.
 
 After an uncertain payment—such as a lost response, missing receipt or
 conflicting receipt—**all further paid calls pause**. The reserved amount stays
@@ -200,9 +212,14 @@ stale data and uncovered tokens are not safety signals. Very low odds say
 
 `dd_60` is close divided by the maximum close in the previous 60 minutes,
 minus one. Zero is the hour's high. At `-0.90` or lower, `already_crashed`
-is true and the row's `note` and `summary` warn that little may be left to
-fall. Unknown drawdown gives a null flag. This is a past-price fact, not a
-new model prediction. Below about 2%, historical crash rates have run up to
+is true; an older collapse reads false. `crashed_within_24h` and
+`last_crash_as_of` say whether an API snapshot saw that threshold within the
+last 24 hours and when (UTC Unix seconds). This memory sees only snapshots the
+API received, and both fields are null while it is unavailable. Either flag
+adds a `note`, and `summary` carries the same context: the odds then describe a
+further 90% drop from the current price, not a recovery or safety signal.
+Unknown drawdown gives a null flag. These are past-price facts, not new model
+predictions. Below about 2%, historical crash rates have run up to
 about twice the predicted value, under one percentage point in absolute
 terms; those answers carry low confidence.
 
@@ -222,7 +239,7 @@ Tests use this checkout's SDK and MCP sources, mocked HTTP and signing, and
 an in-memory MCP session. Socket connections and DNS lookups are disabled.
 They do not prove live settlement or desktop-client integration. The budget
 adapter uses the SDK's watch accounting hook, so the dependency is bounded to
-`hodlodds>=0.3.1,<0.4` and tested before upgrades.
+`hodlodds>=0.3.2,<0.4` and tested before upgrades.
 
 `server.json` contains registry metadata for `com.hodlodds/hodlodds-mcp`.
 Publishing to PyPI and publishing a registry listing are separate steps;
