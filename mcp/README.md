@@ -61,7 +61,8 @@ deterministically when selecting and pricing rows. Answers retain `filters`,
 `defaults_applied`, `excluded_by_defaults` (rows removed only by the defaults,
 before the limit) and `total_matches`.
 
-The lowest odds are usually the least-traded tokens; the default filters remove most inactive or recently collapsed tokens, not all.
+The lowest odds are usually the least-traded tokens; the default filters
+remove most inactive or recently collapsed tokens, not all.
 
 `crash_odds`, `last_known`, `board` and `coverage` accept optional `chain` and `platform`
 strings, comma-separated strings or lists. Currently use `chain="solana"`
@@ -72,12 +73,13 @@ markets and payment networks are separate choices.
 
 Every result includes “Odds, not guarantees. Not financial advice.” Errors
 have MCP `isError: true`, a structured error code and `http_status` when known.
-`client_refused` means the client refused locally before signing: an invalid
-argument, an offer that failed a check, a missing or unreadable key, or a price
-above `HODLODDS_MAX_PRICE_USDC`. Its `message` is the client's fixed refusal
-text, for example “This board costs 0.05 USDC but HODLODDS_MAX_PRICE_USDC is
-0.01; raise it to at least 0.05.” Its `http_status` is null; nothing was signed
-or charged. Recognized public server messages are exposed as `server_error` and
+`client_refused` means the client refused locally before any payment was
+sent: an invalid argument, an offer that failed a check, a missing or
+unreadable key, or a price above `HODLODDS_MAX_PRICE_USDC`. Its `message` is
+the client's fixed refusal text, for example “This board costs 0.05 USDC but
+HODLODDS_MAX_PRICE_USDC is 0.01; raise it to at least 0.05.” Its `http_status`
+is null; nothing was sent or charged. Before 0.2.1 these refusals were
+reported as `paid_request_failed`. Recognized public server messages are exposed as `server_error` and
 `server_code` (such as `offer_changed`); arbitrary rejected content is not
 echoed. As in 0.1.0, `confidence` remains the level string:
 `high`, `medium`, `low`, or `missing`. The new `confidence_detail` field
@@ -214,8 +216,9 @@ stale data and uncovered tokens are not safety signals. Very low odds say
 minus one. Zero is the hour's high. At `-0.90` or lower, `already_crashed`
 is true; an older collapse reads false. `crashed_within_24h` and
 `last_crash_as_of` say whether an API snapshot saw that threshold within the
-last 24 hours and when (UTC Unix seconds). This memory sees only snapshots the
-API received, and both fields are null while it is unavailable. Either flag
+last 24 hours and when (UTC Unix seconds). The memory only knows snapshots the
+API received: a crash that happened entirely during an API outage is not seen.
+Both fields are null while the memory is unavailable. Either flag
 adds a `note`, and `summary` carries the same context: the odds then describe a
 further 90% drop from the current price, not a recovery or safety signal.
 Unknown drawdown gives a null flag. These are past-price facts, not new model

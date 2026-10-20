@@ -651,7 +651,7 @@ async def test_price_cap_refusal_names_the_variable_and_amount(api):
         data = await call(client, "board", limit=10)
     assert data["error"] == "client_refused" and data["http_status"] is None
     assert data["message"] == "This board costs 0.05 USDC but HODLODDS_MAX_PRICE_USDC is 0.01; raise it to at least 0.05."
-    assert data["detail"] == "Refused locally before signing; nothing was signed or charged."
+    assert data["detail"] == "Refused locally before any payment was sent; nothing was sent or charged."
     assert data["spent_atomic"] == 0 and data["payment"] is None
     assert len(api.requests) == 1 and api.signs == api.loads == 0
 

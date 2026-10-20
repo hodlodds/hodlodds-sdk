@@ -28,8 +28,9 @@ Rows expose `already_crashed` (`true`, `false`, or `null` when the drawdown
 is unknown); an older collapse reads `false`. `crashed_within_24h` and
 `last_crash_as_of` say whether an API snapshot saw `dd_60 <= -0.90` for the
 token within the last 24 hours, and the latest such snapshot time (UTC epoch
-seconds). This memory only sees snapshots the API received, not outages, and
-both fields are `null` while it is unavailable. Either crash flag adds a `note`
+seconds). The memory only knows snapshots the API received: a crash that
+happened entirely during an API outage is not seen. Both fields are `null`
+while the memory is unavailable. Either crash flag adds a `note`
 and crash context in `summary`: a low crash probability after a collapse is not
 a recovery or safety signal.
 Below about 2%, observed crash rates have run up to about twice the predicted
@@ -153,12 +154,14 @@ Other sorts keep their existing selection. An explicit `mints=` watchlist
 gets **none of these defaults**: crashed holdings remain visible and flagged
 unless you explicitly request `include_crashed=False`.
 
-The lowest odds are usually the least-traded tokens; the default filters remove most inactive or recently collapsed tokens, not all.
+The lowest odds are usually the least-traded tokens; the default filters
+remove most inactive or recently collapsed tokens, not all.
 
 Board answers return effective `filters`, `defaults_applied` (empty when no
 default was added) and `excluded_by_defaults`, the number of rows removed only
-by those defaults before the limit. The 402 offer body shows the same two
-fields; they are not part of the signed offer. If the API's recent-crash memory
+by those defaults before the limit. The 402 offer body also shows
+`defaults_applied` and `excluded_by_defaults`; they are not part of the signed
+offer. If the API's recent-crash memory
 is unavailable, the defaults reason says so and the crash filter uses only
 `already_crashed`. The offer binds exactly the client's own normalized
 parameters. The server applies its documented defaults deterministically when

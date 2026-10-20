@@ -140,8 +140,8 @@ SERVER_ERROR_TEMPLATES = (
     "chain not available; see /v1/markets. Valid values: ",
     "platform not available; see /v1/markets. Valid values: ",
 )
-# The SDK's own fixed refusals, raised before any authorization is signed
-# (argument checks, offer checks, key loading). Kept in sync with the SDK
+# The SDK's own fixed refusals, raised before any authorization is sent
+# (argument checks, offer checks, key loading, local signing failures). Kept in sync with the SDK
 # source by tests/test_refusals.py.
 CLIENT_REFUSALS = frozenset((
     "mint must be a Solana address",
@@ -446,7 +446,7 @@ class Service:
                 refusal = client_refusal(exc, board=board, max_atomic=self.config.max_atomic) if answer is None else None
                 if refusal is not None:
                     return result(error="client_refused", message=refusal,
-                                  detail="Refused locally before signing; nothing was signed or charged.",
+                                  detail="Refused locally before any payment was sent; nothing was sent or charged.",
                                   http_status=None, payment=None, **self.ledger.fields())
                 return result(error="paid_request_failed", message="Request refused or unavailable; no payment charged.",
                               **error_details(exc),

@@ -1,4 +1,6 @@
 """0.3.2 contract: price-limit details, TLS dependency floor, README and additive fields."""
+import copy
+import pickle
 import re
 import unittest
 from pathlib import Path
@@ -51,6 +53,10 @@ class PriceLimitTests(w.OfflineWatch, unittest.TestCase):
         self.assertEqual((error.price_atomic, error.limit_atomic), (50000, 40000))
         self.assertEqual((error.status, error.body, error.payment), (None, None, None))
         self.assertEqual((self.sdk.signs, self.sdk.loads, len(self.http.calls)), (0, 0, 1))
+        for copied in (pickle.loads(pickle.dumps(error)), copy.copy(error)):
+            self.assertIsInstance(copied, client.PriceLimitError)
+            self.assertEqual((str(copied), copied.price_atomic, copied.limit_atomic),
+                             (str(error), 50000, 40000))
 
     def test_single_answer_above_default_limit(self):
         c = self.make()

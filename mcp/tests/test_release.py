@@ -78,6 +78,7 @@ def test_public_instructions_describe_last_tool_defaults_and_payment_safety():
                   "excluded_by_defaults", "min_liquidity_sol=5", "client_refused"):
         assert field in readme
     assert "Watchlists get **none of these defaults**" in readme
+    assert "Before 0.2.1 these refusals were reported as `paid_request_failed`." in " ".join(readme.split())
     assert " ".join("""This board costs 0.05 USDC but HODLODDS_MAX_PRICE_USDC is
         0.01; raise it to at least 0.05.""".split()) in " ".join(readme.split())
     assert "**before signing only**" in readme

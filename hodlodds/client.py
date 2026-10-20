@@ -65,6 +65,9 @@ class PriceLimitError(HodlOddsError):
         super().__init__("price is invalid or above your USDC limit")
         self.price_atomic, self.limit_atomic = price_atomic, limit_atomic
 
+    def __reduce__(self):
+        return type(self), (self.price_atomic, self.limit_atomic)
+
 
 class PendingPayment(dict):
     """Public receipt fields; redeem credentials stay out of repr/JSON/logs."""
