@@ -1,5 +1,7 @@
 # hodlodds-mcp
 
+<!-- mcp-name: com.hodlodds/hodlodds-mcp -->
+
 A local stdio MCP server for HodlOdds crash odds. Free tools explain token
 coverage, data markets and feed status. With a local wallet configured, paid
 tools use x402 USDC on Solana or Base with per-call and per-session spending

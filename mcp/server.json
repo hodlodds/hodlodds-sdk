@@ -1,12 +1,18 @@
 {
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.hodlodds/hodlodds-mcp",
   "description": "Local crash-odds tools with free market discovery and bounded x402 USDC payments on Solana or Base.",
-  "version": "0.2.1",
+  "version": "0.2.2",
+  "websiteUrl": "https://hodlodds.com",
+  "repository": {
+    "url": "https://github.com/hodlodds/hodlodds-sdk",
+    "source": "github"
+  },
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "hodlodds-mcp",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "transport": {
         "type": "stdio"
       },
@@ -27,7 +33,8 @@
         },
         {
           "name": "HODLODDS_KEYPAIR",
-          "description": "Optional absolute local key-file path; omission enables read-only mode"
+          "description": "Optional absolute local key-file path; omission enables read-only mode",
+          "format": "filepath"
         },
         {
           "name": "HODLODDS_MAX_PRICE_USDC",
