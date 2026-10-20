@@ -3,32 +3,40 @@
 Pay-per-answer **crash odds for Solana memecoins**, paid per request with
 [x402](https://www.x402.org) (USDC on Solana or Base). No accounts, no API keys.
 
-> **Status: pre-launch.** The API at `https://api.hodlodds.com` is not yet open for
-> payments. Its model is being evaluated against a pre-registered forward test.
-> A limited paid beta opens only if it passes. Until then this client is published
-> so you can read the code and test the payment flow on **Solana devnet** or **Base Sepolia**.
+The API at `https://api.hodlodds.com` accepts payments. Check its free status,
+markets and coverage endpoints before paying. Local test servers can use
+**Solana devnet** or **Base Sepolia**.
 
 ## What it answers
 
 > What are the odds that this token's price falls 90% or more within the next 60 minutes?
 
-0.04 means about 4 in 100 tokens like this one lose 90% or more of their price within the next 60 minutes. Higher means riskier, but a low number does not mean safe: smaller or slower drops are not counted, and the odds change minute by minute.
+0.04 is an estimated 4% chance of the defined event within the forecast window.
+Confidence describes historical calibration in that probability range, not a
+guarantee for this token. Higher means riskier, but a low number is not a safety
+signal: smaller or slower drops are not counted, and odds change minute by minute.
 
 A crash is a completed one-minute close, priced in SOL, at least 90% below the
 reference price within the next 60 minutes. Coverage: SOL-quoted pump.fun
 graduates. Every answer carries a confidence level (high / medium / low) based on
 how well past predictions in that probability range matched reality.
 
-| Route | Price (planned) | Notes |
+| Route | Price | Notes |
 |---|---|---|
 | `GET /v1/status` | free | Feed state (`live` / `stale` / `down`), age, incidents, uptime |
 | `GET /v1/meta` | free | Definition, prices, payment details, model card |
+| `GET /v1/markets` | free | Available data chains, platforms and coverage |
+| `GET /v1/coverage/{mint}` | free | Coverage stage and reason for one token |
 | `GET /v1/risk/{mint}` | $0.01 | Fresh odds for one token |
-| `GET /v1/board?limit=N` | $0.005 per coin delivered | Ranked, filtered board of 10–500 covered tokens; pay only for coins returned, empty is free |
+| `GET /v1/board?limit=N` | $0.005 per coin delivered | Request 10–500 coins, or a watchlist of 1–100 distinct mints; pay only for coins returned, empty is free |
 | `GET /v1/risk/{mint}/last` | $0.002 | Last known odds, at most 30 minutes old (also while live); when stale it is labelled stale and confidence drops one level |
 
-You only pay for fresh, covered answers. "Not covered", "feed interrupted" and
-"too old" answers are free, and this client never signs for them.
+The normal risk and board routes charge only for fresh, covered answers. The
+opt-in `/last` route can charge for clearly labelled last-known odds within its
+30-minute limit. Uncovered and ineligible answers are free. A refusal carrying
+`HodlOdds-Charged: no` is treated as free unless a successful payment receipt
+contradicts it; this includes an oversized-header `431`. If eligibility changes
+after signing, that free refusal creates no pending payment.
 
 ### Freshness
 
@@ -51,10 +59,12 @@ Command line:
 
 ```sh
 hodlodds status
-hodlodds risk <MINT> --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIENT> --network devnet
-hodlodds risk <MINT> --keypair ~/.config/hodlodds/base-wallet.json --pay-to <BASE_RECIPIENT> --network base-sepolia
-hodlodds board --limit 100 --sort safest --max-risk 0.05 --min-liquidity 50 --max-price 0.5 \
-  --keypair ... --pay-to ... --network devnet
+hodlodds markets
+hodlodds coverage <MINT> --chain solana --platform pumpfun
+hodlodds risk <MINT> --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIENT> --network solana
+hodlodds risk <MINT> --keypair ~/.config/hodlodds/base-wallet.json --pay-to <BASE_RECIPIENT> --network base
+hodlodds board --limit 100 --sort lowest_risk --max-risk 0.05 --min-liquidity 50 --max-price 0.5 \
+  --keypair ... --pay-to ... --network solana
 ```
 
 Python:
@@ -63,19 +73,23 @@ Python:
 from hodlodds import HodlOdds, HodlOddsError
 
 with HodlOdds("https://api.hodlodds.com", keypair="~/.config/hodlodds/wallet.json",
-              network="devnet", pay_to="<RECIPIENT>", max_price_usdc="0.01") as client:
+              network="solana", pay_to="<RECIPIENT>", max_price_usdc="0.01") as client:
     print(client.status()["state"])
+    print(client.markets())
+    print(client.coverage("<MINT>", chain="solana", platform="pumpfun"))
     try:
         answer = client.risk("<MINT>")
         row = answer.data["row"]
         print(row["p_crash_60m"], row["confidence"]["level"], answer.payment["explorer"])
     except HodlOddsError as e:
-        print(e, e.status, e.body)   # free refusals land here; e.payment is set if a payment may have happened
+        print(e, e.status, e.body)
+        # e.payment["charged"] == False means a confirmed free refusal.
+        # A PendingPayment needs reconciliation or explicit redemption.
 ```
 
-`<RECIPIENT>` is the payment address published in `GET /v1/meta` (and in this
-README at launch). Pin it in your code: the client refuses any offer that pays
-someone else.
+`<RECIPIENT>` is the payment address for your chosen payment network, published
+in `GET /v1/meta`. Verify and pin it in your code: the client refuses any offer
+that pays someone else.
 
 Networks: `devnet` and `solana` (mainnet; `mainnet` is an alias) take a Solana
 JSON key file; `base-sepolia` and `base` take an EVM key file
@@ -87,31 +101,78 @@ base = HodlOdds("https://api.hodlodds.com", keypair="~/.config/hodlodds/base-wal
                 network="base", pay_to="<BASE_RECIPIENT>", max_price_usdc="0.01")
 ```
 
-Board options: `limit` 10–500 (default 50); `sort` = `safest` (default; lowest predicted odds first, a ranking, not a safety claim), `riskiest`,
+Board options: `limit` 10–500 (default 50); `sort` = `lowest_risk` (default), `riskiest`,
 `liquidity`, `newest`, `active`; filters `max_risk`, `min_risk`, `min_liquidity_sol`,
 `min_age_min`, `max_age_min`, `min_trades_5`, `min_confidence` (`high`/`medium`/`low`).
-The total price is `0.005 × coins returned`; pass a `max_price` at least that high
-(the client caps a single board payment at 2.5 USDC).
+The total price is `0.005 × coins returned`; pass `max_price_usdc` in Python or
+`--max-price` on the CLI at least that high. The default per-call maximum is
+0.01 USDC, so boards normally need an explicit higher limit. The hard cap is
+2.5 USDC **for board calls only** and 1 USDC for individual risk/last calls.
+`min_trades_5` accepts integers from 0 through 9223372036854775807.
+
+Compatibility: the 0.2.0 `safest` sort remains accepted as an alias for
+`lowest_risk`, and the `mainnet` payment-network alias still means `solana`.
+These older spellings are deprecated in examples; existing calls keep working.
 
 ```python
-board = client.board(limit=100, sort="safest", max_risk=0.05, min_liquidity_sol=50, max_price_usdc="0.5")
+board = client.board(limit=100, sort="lowest_risk", max_risk=0.05, min_liquidity_sol=50, max_price_usdc="0.5")
 for row in board.data["rows"]:
     print(row["mint"], row["p_crash_60m"], row["confidence"]["level"])
 ```
+
+### Watchlists and market filters
+
+Pass `mints=[mint_a, mint_b]` to restrict a board to 1–100 **distinct** Solana
+mint addresses. Duplicates are rejected locally before any request (and are a
+free 400 on the server). The watchlist default limit is its length; an explicit
+watchlist limit is 1–100. Sorting and filters still apply. The offer is bound to
+the exact normalized selection, including the watchlist digest, before signing.
+Only delivered rows are charged. `answer.data["not_delivered"]` reports coverage
+and filter facts for requested mints that were not returned; it is not a score.
+
+```sh
+hodlodds board --mints <MINT_A>,<MINT_B> --max-price 0.01 \
+  --keypair ... --pay-to ... --network solana
+hodlodds board --mints-file watchlist.txt --max-price 0.50 \
+  --keypair ... --pay-to ... --network solana
+```
+
+Use one mint per line in `--mints-file`; blank lines and `#` comments are ignored.
+The two watchlist flags are mutually exclusive and also work with `watch --board`.
+
+```python
+answer = client.board(mints=[mint_a, mint_b], max_price_usdc="0.01",
+                      chain="solana", platform="pumpfun")
+print(answer.data["rows"], answer.data.get("not_delivered", []))
+```
+
+`chain` and `platform` select the **data market**, independently of the network
+used to pay. They work on `risk`, `last`, `coverage`, `board`, `watch` and
+`watch_board`; CLI equivalents are `--chain` and `--platform`. Python accepts a
+string, comma-separated string or list. Values are case-insensitive; chain
+aliases or CAIP-2 IDs are accepted. `pump` and `pump.fun` are aliases for
+`pumpfun`. Lists contain 1–10 distinct supported values, with OR within a list
+and AND across the two filters. Unsupported or contradictory values are refused
+before payment. Omitting the filters preserves the existing default selection.
+
+Use `client.markets()` / `hodlodds markets` to see supported values;
+`client.coverage(mint)` / `hodlodds coverage <MINT>` explains whether a token is
+covered. Paying on Base does not select Base token data. Experimental non-SOL
+rankings remain outside paid boards and can appear in free risk-route refusals.
 
 ### Watching a token
 
 The watch loop runs entirely in the client. Choose an integer interval from 1 to 60 minutes;
 **`--max-spend` is required** and caps the whole watch in USDC. `--max-price`
-still limits each offer. Examples (devnet; add your wallet flags as in the commands above):
+still limits each offer. Examples (mainnet; pin the published recipient):
 
 ```sh
 hodlodds watch <MINT> --every 1 --max-spend 1.00 \
-  --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIENT> --network devnet
+  --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIENT> --network solana
 hodlodds watch <MINT> --every 5 --max-spend 1.00 --max-calls 20 --alert-above 0.20 \
-  --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIENT> --network devnet
+  --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIENT> --network solana
 hodlodds watch --board --limit 100 --sort riskiest --max-price 0.50 --every 5 --max-spend 2.00 --alert-above 0.20 --json \
-  --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIENT> --network devnet
+  --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIENT> --network solana
 ```
 
 Mainnet still requires explicit `--network solana` or `--network base` and
@@ -187,28 +248,33 @@ interrupt stop. The caller owns and closes the client. Closing the iterator
 or pressing Ctrl-C between cycles stops cleanly. An interrupt during an
 authorized request is reported as ambiguous with reconciliation details.
 
-Any payment error or non-200 authorized response stops the watch immediately;
-there is no payment retry or automatic redemption. The failed attempt's amount
-remains reserved in `spent_atomic`. Python receives `HodlOddsError.payment`;
-the CLI saves the existing private pending-payment file for explicit redemption
-as described below. Other request errors and rejected offers also stop the loop.
-Do not start another watch after an ambiguous payment until it is reconciled.
+After signing, a refusal marked `HodlOdds-Charged: no` without a successful
+payment receipt releases the reserved spend and yields a skipped result; the
+watch continues. It counts toward `--max-calls`. An ambiguous payment, a
+conflicting successful receipt, or another payment error stops the watch; there
+is no payment retry or automatic redemption. An unresolved attempt remains
+reserved in `spent_atomic`. Python receives `HodlOddsError.payment`; the CLI
+saves a private pending-payment file for explicit redemption as described below.
+Other request errors and rejected offers also stop the loop. Do not start
+another watch after an ambiguous payment until it is reconciled.
 
 ### If an answer is lost after you paid
 
-The paid request waits up to 90 seconds (`paid_timeout`, 30–600): verification and
-on-chain settlement usually take one to three seconds. If the connection still ends
-after the payment settled, nothing is lost:
+The paid request waits up to 90 seconds (`paid_timeout`, 30–600). If the
+connection ends after authorization, keep the pending record and use explicit
+recovery instead of paying again:
 
-- The server keeps that payment redeemable **once** for 24 hours.
+- An eligible settled payment whose answer was not delivered can be redeemed
+  **once** within 24 hours; a redeem still checks the route and answer eligibility.
 - In Python, the error carries it: `client.redeem(error.payment)` re-sends the same
   authorization with `HodlOdds-Redeem: 1`. It never signs a new payment and never
   settles a second time.
 - The CLI saves it to `~/.config/hodlodds/pending/<id>.json` (mode 0600) and prints
   the path; run `hodlodds redeem <file>` after about two minutes.
-- While the server is still confirming the payment on-chain, a redeem answers
-  `409` with `Retry-After`; if the payment never settled, it says so (nothing was
-  charged).
+- A `409` may mean confirmation is still pending, no redeemable payment was
+  found, or it has already been redeemed or expired. Follow `Retry-After` when
+  supplied and keep the pending record on refusal. A refused redeem signs and
+  settles nothing new; it does not by itself prove the original payment failed.
 
 Environment variables for the CLI: `HODLODDS_BASE_URL`, `HODLODDS_NETWORK`,
 `HODLODDS_KEYPAIR`, `HODLODDS_PAY_TO`, `HODLODDS_MAX_PRICE`.
@@ -218,8 +284,9 @@ Exit status: `0` success, `1` refusal/API/transport failure, `2` invalid usage.
 
 - A payment is signed only after the 402 offer passes every check: x402 v2, the
   chosen network, exact USDC, authorization flow, the pinned `payTo`, a valid
-  facilitator fee payer distinct from you, a bounded timeout, and a price at or
-  below your limit (default 0.01 USDC, hard cap 1 USDC; exact atomic arithmetic).
+  facilitator fee payer distinct from you on Solana, a bounded timeout, and a price at or
+  below your limit (default 0.01 USDC; hard cap 1 USDC for risk/last and
+  2.5 USDC for board; exact atomic arithmetic).
 - Payments are **never retried automatically**. If anything goes wrong after an
   authorization was sent, the error says so and carries the details
   (`HodlOddsError.payment`) so you can reconcile against your wallet history or
@@ -249,7 +316,7 @@ python -m unittest discover -s tests -v
 ```
 
 The tests run offline with a fake server and a fake SDK seam; with the pinned SDK
-installed, one more test builds a real signature with all RPC calls mocked.
+installed, additional tests build real signatures with all RPC calls mocked.
 
 ## Disclaimer
 

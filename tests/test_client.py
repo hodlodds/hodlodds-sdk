@@ -68,10 +68,10 @@ def settlement():
             "payer": PAYER, "amount": "10000"}
 
 
-def board_offer(sdk, n=10, limit=50, sort="safest", **filters):
+def board_offer(sdk, n=10, limit=50, sort="lowest_risk", mints=None, **filters):
     sdk.offer["accepts"][0]["amount"] = str(n * client.BOARD_ATOMIC_PER_COIN)
     sdk.offer["accepts"][0]["extra"]["hodloddsBoard"] = {
-        "version": 1, "query": client._board_query(limit, sort, filters), "priced_n": n, "nonce": "a" * 32}
+        "version": 1, "query": client._bound_query(client._board_query(limit, sort, filters, mints)), "priced_n": n, "nonce": "a" * 32}
     sdk.offer["accepts"][0]["extra"]["hodloddsBoardSignature"] = "b" * 64  # Server-HMAC shape; verified by server, not client.
     sdk.offer["accepts"][0]["extra"]["memo"] = board_memo(sdk.offer["accepts"][0]["extra"]["hodloddsBoard"])
     sdk.receipt["amount"] = sdk.offer["accepts"][0]["amount"]
@@ -373,7 +373,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.sdk.signs, 1)
 
     def test_board_sort_and_filter_validation_precedes_http_and_key_access(self):
-        bad = [{"limit": v} for v in (9, 501, True, 10.0, "50", None)]
+        bad = [{"limit": v} for v in (9, 501, True, 10.0, "50")]
         bad += [{"sort": v} for v in ("lowest", "highest", None, [])]
         bad += [{name: value} for name, value in (("page", 1), ("cursor", "anything"), ("n", 50),
             ("min_risk", -0.01), ("max_risk", 1.01), ("max_risk", "NaN"), ("min_age_min", -1),
@@ -794,7 +794,7 @@ class SDKIntegrationTests(unittest.TestCase):
         if board:
             requirement["accepts"][0]["amount"] = receipt["amount"] = "2500000"
             requirement["accepts"][0]["extra"]["hodloddsBoard"] = {
-                "version": 1, "query": client._board_query(500, "safest", {"min_liquidity_sol": 100}),
+                "version": 1, "query": client._bound_query(client._board_query(500, "lowest_risk", {"min_liquidity_sol": 100})),
                 "priced_n": 500, "nonce": "a" * 32}
             requirement["accepts"][0]["extra"]["hodloddsBoardSignature"] = "b" * 64
             requirement["accepts"][0]["extra"]["memo"] = board_memo(requirement["accepts"][0]["extra"]["hodloddsBoard"])

@@ -37,7 +37,7 @@ USDC_ATOMIC = Decimal(10) ** 6
 HARD_MAX_USDC = Decimal("1")
 BOARD_MAX_USDC = Decimal("2.5")
 BOARD_ATOMIC_PER_COIN = 5000
-BOARD_SORTS = ("safest", "riskiest", "liquidity", "newest", "active")
+BOARD_SORTS = ("lowest_risk", "safest", "riskiest", "liquidity", "newest", "active")
 BOARD_FILTERS = ("max_risk", "min_risk", "min_liquidity_sol", "min_age_min", "max_age_min",
                  "min_trades_5", "min_confidence")
 BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -192,11 +192,51 @@ def _usdc(value, name, maximum=HARD_MAX_USDC):
     raise HodlOddsError(message)
 
 
-def _board_query(limit, sort, filters):
+# Standalone client vocabulary; checked against cloud.markets by offline tests.
+# /v1/markets remains authoritative when the server adds markets.
+AVAILABLE_CHAINS = {"solana": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"}
+AVAILABLE_PLATFORMS = {"pumpfun": "pumpfun", "pump": "pumpfun", "pump.fun": "pumpfun"}
+
+
+def _market_query(chain=None, platform=None):
+    result = {}
+    chains = {**AVAILABLE_CHAINS, **{v.lower(): v for v in AVAILABLE_CHAINS.values()}}
+    for name, raw, allowed in (("chain", chain, chains), ("platform", platform, AVAILABLE_PLATFORMS)):
+        if raw is None:
+            continue
+        parts = raw.split(",") if isinstance(raw, str) else raw
+        if (not isinstance(parts, (list, tuple)) or not 1 <= len(parts) <= 10
+                or any(not isinstance(p, str) or not p.strip() for p in parts)):
+            raise HodlOddsError(name + " must contain 1..10 non-empty values")
+        values = [allowed.get(p.strip().lower()) for p in parts]
+        if None in values:
+            raise HodlOddsError(name + " not available; see /v1/markets")
+        if len(set(values)) != len(values):
+            raise HodlOddsError("duplicate " + name + " value")
+        result[name + "s"] = sorted(values)
+    return result
+
+
+def _market_path(path, chain=None, platform=None):
+    query = _market_query(chain, platform)
+    return path + ("?" + urlencode({k[:-1]: ",".join(v) for k, v in query.items()}) if query else "")
+
+
+def _board_query(limit, sort, filters, mints=None, chain=None, platform=None):
     # validate before HTTP/key access and send a
     # canonical query; the returned offer must describe this same selection.
-    if type(limit) is not int or not 10 <= limit <= 500:
-        raise HodlOddsError("limit must be an integer between 10 and 500")
+    if mints is not None:
+        if (not isinstance(mints, (list, tuple)) or not 1 <= len(mints) <= 100
+                or any(not _address(mint) for mint in mints)):
+            raise HodlOddsError("mints must contain 1..100 valid Solana mint addresses")
+        if len(set(mints)) != len(mints):
+            raise HodlOddsError("duplicate mints are not allowed")
+        mints = sorted(mints)
+    if limit is None:
+        limit = len(mints) if mints else 50
+    minimum, maximum = (1, 100) if mints else (10, 500)
+    if type(limit) is not int or not minimum <= limit <= maximum:
+        raise HodlOddsError("limit must be an integer between %d and %d" % (minimum, maximum))
     if sort not in BOARD_SORTS:
         raise HodlOddsError("sort must be one of: " + ", ".join(BOARD_SORTS))
     unknown = set(filters) - set(BOARD_FILTERS)
@@ -211,8 +251,8 @@ def _board_query(limit, sort, filters):
             if value not in ("high", "medium", "low"):
                 raise HodlOddsError("min_confidence must be high, medium or low")
         elif name == "min_trades_5":
-            if type(value) is not int or value < 0:
-                raise HodlOddsError("min_trades_5 must be a nonnegative integer")
+            if type(value) is not int or not 0 <= value <= 2**63 - 1:
+                raise HodlOddsError("min_trades_5 must be an integer between 0 and 9223372036854775807")
         else:
             try:
                 if isinstance(value, bool) or value is None:
@@ -228,7 +268,30 @@ def _board_query(limit, sort, filters):
     for lo, hi in (("min_risk", "max_risk"), ("min_age_min", "max_age_min")):
         if lo in normalized and hi in normalized and normalized[lo] > normalized[hi]:
             raise HodlOddsError(lo + " must not exceed " + hi)
-    return {"limit": limit, "sort": sort, "filters": normalized}
+    query = {"limit": limit, "sort": sort, "filters": normalized, **_market_query(chain, platform)}
+    if mints is not None:
+        query["mints"] = mints
+    return query
+
+
+def _bound_query(query):
+    """Compact payment binding; selection still uses the original URL list."""
+    result = dict(query)
+    if 'mints' in result:
+        mints = result.pop('mints')
+        result['mints_sha256'] = hashlib.sha256(','.join(sorted(mints)).encode('ascii')).hexdigest()
+        result['mints_count'] = len(mints)
+    return result
+
+
+def _board_params(query):
+    params = {"limit": query["limit"], "sort": query["sort"], **query["filters"]}
+    if "mints" in query:
+        params["mints"] = ",".join(query["mints"])
+    for name in ("chains", "platforms"):
+        if name in query:
+            params[name[:-1]] = ",".join(query[name])
+    return params
 
 
 def _base58_size(value):
@@ -375,7 +438,7 @@ class HodlOdds:
                     or any(c in k + v for c in "\r\n") or k.lower().startswith(("payment-", "x-payment"))
                     or k.lower() in ("host", "content-length", "transfer-encoding")):
                 raise HodlOddsError("access_headers contains an invalid or reserved payment/transport header")
-        headers["User-Agent"] = "hodlodds-python/0.3"
+        headers["User-Agent"] = "hodlodds-python/0.3.0"
         try:
             self.http = _new_http(timeout, headers)
         except Exception:
@@ -388,36 +451,43 @@ class HodlOdds:
     def meta(self):
         return self._get_json("/v1/meta")
 
+    def markets(self):
+        return self._get_json("/v1/markets")
+
+    def coverage(self, mint, chain=None, platform=None):
+        return self._get_json(_market_path("/v1/coverage/" + self._mint(mint), chain, platform))
+
     # Paid routes (free when the API cannot sell a fresh, covered answer)
-    def risk(self, mint, max_price_usdc=None):
-        return self._paid("/v1/risk/" + self._mint(mint), max_price_usdc)
+    def risk(self, mint, max_price_usdc=None, *, chain=None, platform=None):
+        return self._paid(_market_path("/v1/risk/" + self._mint(mint), chain, platform), max_price_usdc)
 
-    def last(self, mint, max_price_usdc=None):
+    def last(self, mint, max_price_usdc=None, *, chain=None, platform=None):
         """Last-known odds (<= 30 min old, labelled stale, confidence downgraded); 0.002 USDC."""
-        return self._paid("/v1/risk/" + self._mint(mint) + "/last", max_price_usdc)
+        return self._paid(_market_path("/v1/risk/" + self._mint(mint) + "/last", chain, platform), max_price_usdc)
 
-    def board(self, limit=50, sort="safest", max_price_usdc=None, **filters):
+    def board(self, limit=None, sort="lowest_risk", max_price_usdc=None, *, mints=None, chain=None, platform=None, **filters):
         """Current covered SOL ranking; 0.005 USDC per delivered coin, at most 500.
 
         Pass a per-call maximum covering the dynamic total (e.g. 0.5 for 100
-        coins). An empty match set is free. No pagination or automatic retries.
+        coins). With mints, limit defaults to list size (1..100); otherwise 50
+        (10..500). An empty match set is free. No pagination or automatic retries.
         """
-        query = _board_query(limit, sort, filters)
-        params = {"limit": query["limit"], "sort": query["sort"], **query["filters"]}
+        query = _board_query(limit, sort, filters, mints, chain, platform)
+        params = _board_params(query)
         return self._paid("/v1/board?" + urlencode(params), max_price_usdc, board_query=query)
 
     def watch(self, mint, every_minutes=5, *, max_spend_usdc, max_calls=None,
-              alert_above=None, stop_on_stale=False):
+              alert_above=None, stop_on_stale=False, chain=None, platform=None):
         """Closeable generator of Answers; estimate and spent_atomic live on the iterator."""
-        return Watch(self, "/v1/risk/" + self._mint(mint), every_minutes,
+        return Watch(self, _market_path("/v1/risk/" + self._mint(mint), chain, platform), every_minutes,
                      max_spend_usdc, max_calls, alert_above, stop_on_stale)
 
     def watch_board(self, every_minutes=5, *, max_spend_usdc, max_calls=None,
-                    alert_above=None, stop_on_stale=False, limit=50, sort="safest",
-                    max_price_usdc=None, **filters):
+                    alert_above=None, stop_on_stale=False, limit=None, sort="lowest_risk",
+                    max_price_usdc=None, mints=None, chain=None, platform=None, **filters):
         """Watch a board with the same query binding and price checks as board()."""
-        query = _board_query(limit, sort, filters)
-        params = {"limit": query["limit"], "sort": query["sort"], **query["filters"]}
+        query = _board_query(limit, sort, filters, mints, chain, platform)
+        params = _board_params(query)
         return Watch(self, "/v1/board?" + urlencode(params), every_minutes,
                      max_spend_usdc, max_calls, alert_above, stop_on_stale,
                      max_price_usdc=max_price_usdc, board_query=query)
@@ -571,7 +641,7 @@ class HodlOdds:
             if (not isinstance(board, dict) or type(board.get("version")) is not int or board["version"] != 1
                     or set(board) != {"version", "query", "priced_n", "nonce"}
                     or json.dumps(board.get("query"), sort_keys=True, allow_nan=False)
-                    != json.dumps(board_query, sort_keys=True, allow_nan=False)
+                    != json.dumps(_bound_query(board_query), sort_keys=True, allow_nan=False)
                     or type(board.get("priced_n")) is not int
                     or not 1 <= board["priced_n"] <= board_query["limit"]
                     or not isinstance(board.get("nonce"), str) or not re.fullmatch("[0-9a-f]{32}", board["nonce"])
@@ -679,8 +749,17 @@ class HodlOdds:
             # not establish absence of settlement, even on normally free errors.
             paid = self._request(url, headers={"PAYMENT-SIGNATURE": signature}, timeout=self.paid_timeout)
             receipt = paid.headers.get("payment-response")
+            info = protocol["settled"](receipt).model_dump(by_alias=True, exclude_none=True) if receipt else {}
+            if (paid.status_code != 200 and paid.headers.get('hodlodds-charged') == 'no'
+                    and info.get('success') is not True and not info.get('transaction')):
+                payment = dict(payment, charged=False, success=False)
+                if _watch is not None:
+                    _watch.spent_atomic -= amount
+                body = _body(paid)
+                reason = body.get('error', 'HTTP %d' % paid.status_code) if isinstance(body, dict) else 'HTTP %d' % paid.status_code
+                raise HodlOddsError('refused before settlement: ' + str(reason), paid.status_code,
+                                    body, payment=payment)
             if receipt:
-                info = protocol["settled"](receipt).model_dump(by_alias=True, exclude_none=True)
                 tx = info.get("transaction")
                 if (_base58_size(tx) == 64 if self.net["family"] == "svm" else
                         isinstance(tx, str) and bool(re.fullmatch("0x[0-9a-fA-F]{64}", tx))):
@@ -708,6 +787,8 @@ class HodlOdds:
             reason = (str(exc) if isinstance(exc, HodlOddsError) else
                       "authorized request interrupted" if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
                       else "invalid payment response")
+            if payment.get('charged') is False:
+                raise HodlOddsError(reason, paid.status_code, _body(paid), payment=payment) from None
             if payment["success"] is False:
                 # Facilitator-declared failure: say so plainly, keep the reconcile facts.
                 raise HodlOddsError(reason + ". Not retried. Check %(amount_usdc)s USDC on %(network)s from %(payer)s "
@@ -851,6 +932,12 @@ class Watch:
                     self.stop_reason = "spending cap reached"
                     yield self._result(Answer(None, status), self.stop_reason)
                     return
+                except HodlOddsError as exc:
+                    if not exc.payment or exc.payment.get('charged') is not False:
+                        raise
+                    self.calls += 1
+                    yield self._result(Answer(exc.status, exc.body if isinstance(exc.body, dict) else {}), str(exc))
+                    continue
                 self.calls += 1
                 if answer.paid:
                     as_of = answer.data.get("as_of")
@@ -922,7 +1009,7 @@ def _watch_row(row):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="HodlOdds x402 client")
-    p.add_argument("command", choices=["status", "meta", "risk", "last", "board", "redeem", "watch"])
+    p.add_argument("command", choices=["status", "meta", "markets", "coverage", "risk", "last", "board", "redeem", "watch"])
     p.add_argument("mint", nargs="?")
     p.add_argument("--base-url", default=os.environ.get("HODLODDS_BASE_URL", "https://api.hodlodds.com"))
     p.add_argument("--network", default=os.environ.get("HODLODDS_NETWORK", "devnet"), choices=sorted(NETWORKS))
@@ -930,9 +1017,14 @@ def main(argv=None):
     p.add_argument("--pay-to", default=os.environ.get("HODLODDS_PAY_TO"))
     p.add_argument("--max-price", default=os.environ.get("HODLODDS_MAX_PRICE", "0.01"),
                    help="USDC spending limit (default 0.01; hard cap 2.5 for board, 1 otherwise)")
+    p.add_argument("--chain", help="data chain alias or CAIP-2 ID; comma-separated values")
+    p.add_argument("--platform", help="launch platform; comma-separated values")
     p.add_argument("--rpc-url")
-    p.add_argument("--limit", type=int, default=50, help="board coins requested, 10..500 (default 50)")
-    p.add_argument("--sort", default="safest", choices=BOARD_SORTS)
+    p.add_argument("--limit", type=int, help="board coins: 10..500 (default 50); with mints: 1..100 (default list size)")
+    lists = p.add_mutually_exclusive_group()
+    lists.add_argument("--mints", help="comma-separated watchlist, 1..100 distinct mints")
+    lists.add_argument("--mints-file", help="watchlist file, one mint per line, max 100")
+    p.add_argument("--sort", default="lowest_risk", choices=BOARD_SORTS)
     p.add_argument("--max-risk")
     p.add_argument("--min-risk")
     p.add_argument("--min-liquidity", dest="min_liquidity_sol")
@@ -949,11 +1041,11 @@ def main(argv=None):
     p.add_argument("--json", action="store_true", help="watch results as JSON Lines")
     args = list(sys.argv[1:] if argv is None else argv)
     a = p.parse_args(args)
-    if a.command in ("risk", "last") and not a.mint:
+    if a.command in ("risk", "last", "coverage") and not a.mint:
         p.error(a.command + " needs a mint address")
     if a.command == "redeem" and not a.mint:
         p.error("redeem needs a pending payment file")
-    if a.command not in ("risk", "last", "redeem", "watch") and a.mint:
+    if a.command not in ("risk", "last", "coverage", "redeem", "watch") and a.mint:
         p.error(a.command + " does not take a mint")
     explicit = lambda flag: any(v == flag or v.startswith(flag + "=") for v in args)
     if a.command == "watch":
@@ -964,14 +1056,34 @@ def main(argv=None):
     elif any(explicit(flag) for flag in ("--board", "--every", "--max-spend", "--max-calls",
                                         "--alert-above", "--stop-on-stale", "--json")):
         p.error("watch options can be used only with watch")
+    if a.command not in ("risk", "last", "coverage", "board", "watch") and (a.chain is not None or a.platform is not None):
+        p.error("chain/platform filters require a data command")
     is_board = a.command == "board" or (a.command == "watch" and a.board)
-    board_flags = ("--limit", "--sort", "--max-risk", "--min-risk", "--min-liquidity", "--min-age",
+    board_flags = ("--mints", "--mints-file", "--limit", "--sort", "--max-risk", "--min-risk", "--min-liquidity", "--min-age",
                    "--max-age", "--min-trades", "--min-confidence")
     if not is_board and any(explicit(flag) for flag in board_flags):
         p.error("board filters and sorting can be used only with board")
     if a.command != "redeem" and a.network in ("mainnet", "solana", "base") and not (explicit("--network") and explicit("--pay-to")):
         p.error("mainnet requires explicit --network and --pay-to; environment defaults are not enough")
     try:
+        _market_query(a.chain, a.platform)
+        market_options = {k: v for k, v in (("chain", a.chain), ("platform", a.platform)) if v is not None}
+        mints = a.mints.split(",") if a.mints is not None else None
+        if a.mints_file is not None:
+            try:
+                with open(a.mints_file, encoding="utf-8") as source:
+                    mints = []
+                    for line in source:
+                        line = line.split("#", 1)[0].strip()  # blank lines and # comments are ignored
+                        if line:
+                            mints.append(line)
+                        if len(mints) > 100:
+                            break
+            except (OSError, UnicodeError):
+                raise HodlOddsError("cannot read mints file") from None
+        if is_board:
+            filters = {name: getattr(a, name) for name in BOARD_FILTERS if getattr(a, name) is not None}
+            _board_query(a.limit, a.sort, filters, mints, a.chain, a.platform)
         pending = load_pending(a.mint) if a.command == 'redeem' else None
         if pending is not None:
             a.base_url, a.network, a.pay_to = pending._base, pending['network'], pending['pay_to']
@@ -982,10 +1094,10 @@ def main(argv=None):
                                alert_above=a.alert_above, stop_on_stale=a.stop_on_stale)
                 if a.board:
                     filters = {name: getattr(a, name) for name in BOARD_FILTERS if getattr(a, name) is not None}
-                    watching = client.watch_board(limit=a.limit, sort=a.sort, max_price_usdc=a.max_price,
-                                                  **options, **filters)
+                    watching = client.watch_board(limit=a.limit, sort=a.sort, max_price_usdc=a.max_price, mints=mints,
+                                                  **options, **market_options, **filters)
                 else:
-                    watching = client.watch(a.mint, **options)
+                    watching = client.watch(a.mint, **options, **market_options)
                 print("Watch estimate: %(price_per_call_usdc)s USDC/call × %(calls_per_hour)s calls/h = "
                       "%(per_hour_usdc)s USDC/h, %(per_24h_usdc)s USDC/24h; cap %(cap_usdc)s USDC"
                       % watching.estimate, file=sys.stderr, flush=True)
@@ -997,16 +1109,19 @@ def main(argv=None):
                 if watching.stop_reason:
                     print("Watch stopped: " + watching.stop_reason, file=sys.stderr)
                 return 0
-            if a.command in ("status", "meta"):
+            if a.command in ("status", "meta", "markets"):
                 print(json.dumps(getattr(client, a.command)(), indent=2))
+                return 0
+            if a.command == "coverage":
+                print(json.dumps(client.coverage(a.mint, **market_options), indent=2))
                 return 0
             if a.command == "redeem":
                 answer = client.redeem(pending)
             elif a.command == "board":
                 filters = {name: getattr(a, name) for name in BOARD_FILTERS if getattr(a, name) is not None}
-                answer = client.board(limit=a.limit, sort=a.sort, max_price_usdc=a.max_price, **filters)
+                answer = client.board(limit=a.limit, sort=a.sort, max_price_usdc=a.max_price, mints=mints, **market_options, **filters)
             else:
-                answer = getattr(client, a.command)(a.mint)
+                answer = getattr(client, a.command)(a.mint, **market_options)
             print(json.dumps(answer.data, indent=2))
             if answer.payment:
                 verb = "Redeemed (no new payment; paid earlier)" if answer.payment.get("redeemed") else "Paid"
