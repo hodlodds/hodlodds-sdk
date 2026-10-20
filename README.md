@@ -21,6 +21,16 @@ reference price within the next 60 minutes. Coverage: SOL-quoted pump.fun
 graduates. Every answer carries a confidence level (high / medium / low) based on
 how well past predictions in that probability range matched reality.
 
+`dd_60` is the latest close divided by the maximum close in the previous
+60 minutes, minus one. Zero means the token is at that hour's high;
+`dd_60 <= -0.90` means it has already fallen at least 90% within the hour.
+Rows expose `already_crashed` (`true`, `false`, or `null` when the drawdown
+is unknown). A true value also carries a `note` and a warning in `summary`:
+a low crash probability after a collapse is not a recovery or safety signal.
+Below about 2%, observed crash rates have run up to about twice the predicted
+value, under one percentage point in absolute terms; those answers carry
+`confidence: low`.
+
 | Route | Price | Notes |
 |---|---|---|
 | `GET /v1/status` | free | Feed state (`live` / `stale` / `down`), age, incidents, uptime |
@@ -58,7 +68,7 @@ Python 3.10+. Dependencies: `httpx` and the official `x402[svm,evm]==2.25.0` SDK
 The separate [hodlodds-mcp package](mcp/) provides local stdio tools for market
 discovery and crash odds, with per-call and session payment limits.
 
-`pip install hodlodds-mcp` (after the first mcp-v0.1.0 release).
+`pip install hodlodds-mcp`
 See [the MCP README](mcp/README.md) for client configuration and payment safety.
 
 ## Use
@@ -73,6 +83,7 @@ hodlodds risk <MINT> --keypair ~/.config/hodlodds/wallet.json --pay-to <RECIPIEN
 hodlodds risk <MINT> --keypair ~/.config/hodlodds/base-wallet.json --pay-to <BASE_RECIPIENT> --network base
 hodlodds board --limit 100 --sort lowest_risk --max-risk 0.05 --min-liquidity 50 --max-price 0.5 \
   --keypair ... --pay-to ... --network solana
+hodlodds last <MINT> --keypair ... --pay-to ... --network solana
 ```
 
 Python:
@@ -111,7 +122,8 @@ base = HodlOdds("https://api.hodlodds.com", keypair="~/.config/hodlodds/base-wal
 
 Board options: `limit` 10–500 (default 50); `sort` = `lowest_risk` (default), `riskiest`,
 `liquidity`, `newest`, `active`; filters `max_risk`, `min_risk`, `min_liquidity_sol`,
-`min_age_min`, `max_age_min`, `min_trades_5`, `min_confidence` (`high`/`medium`/`low`).
+`min_age_min`, `max_age_min`, `min_trades_5`, `min_confidence` (`high`/`medium`/`low`)
+and `include_crashed` (`True`/`False`).
 The total price is `0.005 × coins returned`; pass `max_price_usdc` in Python or
 `--max-price` on the CLI at least that high. The default per-call maximum is
 0.01 USDC, so boards normally need an explicit higher limit. The hard cap is
@@ -122,11 +134,52 @@ Compatibility: the 0.2.0 `safest` sort remains accepted as an alias for
 `lowest_risk`, and the `mainnet` payment-network alias still means `solana`.
 These older spellings are deprecated in examples; existing calls keep working.
 
+For `lowest_risk` and its `safest` alias, the server applies
+`min_trades_5=3` and `include_crashed=false` when those filters are omitted,
+so barely traded or already-collapsed tokens do not dominate the list.
+Explicit values override the defaults, including `min_trades_5=0` and
+`include_crashed=True` (CLI: `--min-trades 0 --include-crashed`).
+Other sorts keep their existing selection. An explicit `mints=` watchlist
+gets **neither default**: crashed holdings remain visible and flagged unless
+you explicitly request `include_crashed=False`.
+
+Board answers return effective `filters` and `defaults_applied`, which is
+empty when no default was added. The offer binds exactly the client's own
+normalized parameters. The server applies its documented defaults
+deterministically when selecting and pricing rows; the client does not add
+those defaults to the signed query.
+
 ```python
 board = client.board(limit=100, sort="lowest_risk", max_risk=0.05, min_liquidity_sol=50, max_price_usdc="0.5")
 for row in board.data["rows"]:
     print(row["mint"], row["p_crash_60m"], row["confidence"]["level"])
+# Explicitly include quiet and already-collapsed tokens:
+all_rows = client.board(min_trades_5=0, include_crashed=True, max_price_usdc="0.25")
+# The cheaper, opt-in answer preserves its original horizon and labels its age:
+last_known = client.last("<MINT>")
+print(last_known.data["age_s"], last_known.data["freshness"])
 ```
+
+`last()` costs 0.002 USDC and can return last-known odds up to 30 minutes
+old, including while the feed is live. Check `stale`, `age_s`, `freshness`
+and `horizon_remaining_s`; buying the answer does not renew its forecast.
+
+### When a board offer changes
+
+A board `409` with `code: "offer_changed"` means the matching set changed
+between the offer and the paid request; the server marks that refusal
+`HodlOdds-Charged: no`. SDK 0.3.1 requests a new offer **once only if the
+409 occurs before signing**, with no successful or uncertain receipt. It
+uses the same query and repeats all price and budget checks. There is no
+extra spend for this unsigned offer refresh.
+
+A board `409` with `code: "offer_changed"` received after a **signed request**
+is **never retried automatically**. With `HodlOdds-Charged: no` and no conflicting
+receipt, nothing was charged, but the client must call again; the SDK never
+re-signs on its own. A second automatic authorization could be settled twice
+if a server misbehaved. Watch loops treat a
+confirmed free refusal as a skip and continue on their next scheduled
+cycle. Uncertain payments stop the watch and require reconciliation.
 
 ### Watchlists and market filters
 

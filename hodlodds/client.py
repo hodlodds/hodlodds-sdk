@@ -39,7 +39,7 @@ BOARD_MAX_USDC = Decimal("2.5")
 BOARD_ATOMIC_PER_COIN = 5000
 BOARD_SORTS = ("lowest_risk", "safest", "riskiest", "liquidity", "newest", "active")
 BOARD_FILTERS = ("max_risk", "min_risk", "min_liquidity_sol", "min_age_min", "max_age_min",
-                 "min_trades_5", "min_confidence")
+                 "min_trades_5", "min_confidence", "include_crashed")
 BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MAX_PAYMENT_HEADER = 16384
 MAX_SIGNATURE_HEADER = 65536
@@ -247,7 +247,10 @@ def _board_query(limit, sort, filters, mints=None, chain=None, platform=None):
         if name not in filters:
             continue
         value = filters[name]
-        if name == "min_confidence":
+        if name == "include_crashed":
+            if type(value) is not bool:
+                raise HodlOddsError("include_crashed must be a boolean")
+        elif name == "min_confidence":
             if value not in ("high", "medium", "low"):
                 raise HodlOddsError("min_confidence must be high, medium or low")
         elif name == "min_trades_5":
@@ -286,6 +289,8 @@ def _bound_query(query):
 
 def _board_params(query):
     params = {"limit": query["limit"], "sort": query["sort"], **query["filters"]}
+    if "include_crashed" in params:
+        params["include_crashed"] = "true" if params["include_crashed"] else "false"
     if "mints" in query:
         params["mints"] = ",".join(query["mints"])
     for name in ("chains", "platforms"):
@@ -438,7 +443,7 @@ class HodlOdds:
                     or any(c in k + v for c in "\r\n") or k.lower().startswith(("payment-", "x-payment"))
                     or k.lower() in ("host", "content-length", "transfer-encoding")):
                 raise HodlOddsError("access_headers contains an invalid or reserved payment/transport header")
-        headers["User-Agent"] = "hodlodds-python/0.3.0"
+        headers["User-Agent"] = "hodlodds-python/0.3.1"
         try:
             self.http = _new_http(timeout, headers)
         except Exception:
@@ -462,7 +467,7 @@ class HodlOdds:
         return self._paid(_market_path("/v1/risk/" + self._mint(mint), chain, platform), max_price_usdc)
 
     def last(self, mint, max_price_usdc=None, *, chain=None, platform=None):
-        """Last-known odds (<= 30 min old, labelled stale, confidence downgraded); 0.002 USDC."""
+        """Labelled last-known odds (<= 30 min); stale confidence is downgraded; 0.002 USDC."""
         return self._paid(_market_path("/v1/risk/" + self._mint(mint) + "/last", chain, platform), max_price_usdc)
 
     def board(self, limit=None, sort="lowest_risk", max_price_usdc=None, *, mints=None, chain=None, platform=None, **filters):
@@ -470,7 +475,9 @@ class HodlOdds:
 
         Pass a per-call maximum covering the dynamic total (e.g. 0.5 for 100
         coins). With mints, limit defaults to list size (1..100); otherwise 50
-        (10..500). An empty match set is free. No pagination or automatic retries.
+        (10..500). An empty match set is free. A changed unsigned offer may be
+        refreshed once; an authorized request is never automatically retried.
+        Low-risk defaults are applied by the server, never added to our binding.
         """
         query = _board_query(limit, sort, filters, mints, chain, platform)
         params = _board_params(query)
@@ -692,11 +699,20 @@ class HodlOdds:
         limit = self.max_atomic if max_price_usdc is None else _usdc(max_price_usdc, "max_price_usdc", maximum)
         url = self.base + path
         first = self._request(url)
+        # Only refresh an UNSIGNED board request. In particular, this code is
+        # outside the authorized-request block: even a charged:no 409 after
+        # signing must return to the caller, never create another authorization.
+        if board_query is not None and _offer_changed_unsigned(first):
+            first = self._request(url)
         if first.status_code == 200:
             return Answer(200, _json_object(first))
         if first.status_code != 402:
             # Free refusals: not covered (404), feed interrupted (503), too old (410), ...
-            raise HodlOddsError("free answer HTTP %d (nothing paid)" % first.status_code, first.status_code, _body(first))
+            # A second changed offer is a free watch skip, not an endless retry.
+            free_change = board_query is not None and _offer_changed_unsigned(first)
+            raise HodlOddsError("free answer HTTP %d (nothing paid)" % first.status_code,
+                                first.status_code, _body(first),
+                                payment={"charged": False, "success": False} if free_change else None)
         header = first.headers.get("payment-required")
         if not header:
             raise HodlOddsError("402 without a valid PAYMENT-REQUIRED header; nothing paid", 402)
@@ -953,6 +969,15 @@ class Watch:
             return
 
 
+def _offer_changed_unsigned(response):
+    """No authorization has been sent; contradictory receipt metadata forbids refresh."""
+    if (response.status_code != 409 or response.headers.get("payment-response")
+            or response.headers.get("hodlodds-charged") not in (None, "no")):
+        return False
+    body = _body(response)
+    return isinstance(body, dict) and body.get("code") == "offer_changed"
+
+
 def _body(response):
     try:
         return response.json()
@@ -1032,6 +1057,8 @@ def main(argv=None):
     p.add_argument("--max-age", dest="max_age_min")
     p.add_argument("--min-trades", dest="min_trades_5", type=int)
     p.add_argument("--min-confidence", choices=("high", "medium", "low"))
+    p.add_argument("--include-crashed", action=argparse.BooleanOptionalAction, default=None,
+                   help="include already-crashed board rows; --no-include-crashed filters them")
     p.add_argument("--board", action="store_true", help="watch a board instead of a mint")
     p.add_argument("--every", type=int, default=5, help="watch interval in minutes, 1..60")
     p.add_argument("--max-spend", help="required watch spending cap in USDC")
@@ -1060,7 +1087,7 @@ def main(argv=None):
         p.error("chain/platform filters require a data command")
     is_board = a.command == "board" or (a.command == "watch" and a.board)
     board_flags = ("--mints", "--mints-file", "--limit", "--sort", "--max-risk", "--min-risk", "--min-liquidity", "--min-age",
-                   "--max-age", "--min-trades", "--min-confidence")
+                   "--max-age", "--min-trades", "--min-confidence", "--include-crashed", "--no-include-crashed")
     if not is_board and any(explicit(flag) for flag in board_flags):
         p.error("board filters and sorting can be used only with board")
     if a.command != "redeem" and a.network in ("mainnet", "solana", "base") and not (explicit("--network") and explicit("--pay-to")):
