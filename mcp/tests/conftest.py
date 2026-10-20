@@ -1,10 +1,11 @@
-"""Test local MCP source against the installed public HodlOdds dependency."""
+"""Test the local MCP and SDK sources together; all network access is disabled."""
 import socket
 import sys
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 

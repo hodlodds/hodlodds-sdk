@@ -132,6 +132,42 @@ def receipt(payment):
             ("network", "amount_usdc", "transaction", "payer", "pay_to", "success", "charged")}
 
 
+def error_details(exc):
+    """Expose fixed public refusal text, never arbitrary echoed inputs or SDK exceptions."""
+    if not isinstance(exc, HodlOddsError):
+        return {"http_status": None}
+    result = {"http_status": exc.status}
+    body = exc.body if isinstance(exc.body, dict) else {}
+    if body.get("code") == "offer_changed":
+        result["server_code"] = "offer_changed"
+    message = body.get("error")
+    fixed = {
+        "matches changed; request again", "Board offer changed; request again",
+        "Board payment amount changed; request again",
+        "Invalid mint", "Mint is not currently covered", "Outside validated SOL coverage",
+        "Feed interrupted", "Last known odds too old", "Paid service is not available",
+        "Payment required", "Payment service unavailable", "Payment replay check unavailable",
+        "Payment already submitted; reconcile the original payment before retrying",
+        "Payment header too large", "Rate limit exceeded", "Server busy",
+        "No redeemable payment found", "Final freshness check unavailable",
+        "Answer freshness changed; request again", "include_crashed must be true or false",
+        "min_confidence must be high, medium or low", "Duplicate mints are not allowed",
+        "mints must contain 1..100 valid Solana mint addresses",
+        "sort must be one of: lowest_risk, safest, riskiest, liquidity, newest, active",
+    }
+    fields = ("limit", "min_risk", "max_risk", "min_liquidity_sol", "min_age_min",
+              "max_age_min", "min_trades_5")
+    suffixes = (" must be an integer", " is too large", " must be 10..500",
+                " must be 1..100", " must be 0..9223372036854775807",
+                " must be a finite number", " must be a finite non-negative number",
+                " must be between 0 and 1")
+    fixed.update(name + tail for name in fields for tail in suffixes)
+    fixed.update(("min_risk must not exceed max_risk", "min_age_min must not exceed max_age_min"))
+    if isinstance(message, str) and message in fixed:
+        result["server_error"] = message
+    return result
+
+
 def summary(p):
     """Same fresh-row wording/rounding as cloud/summary.py, without a server dependency."""
     percent = p * 100
@@ -162,10 +198,13 @@ def odds_row(row):
     level = confidence.get("level")
     output = {**row, "mint": row["mint"], "p_crash_60m": p, "odds_percent": p * 100,
             "summary": row.get("summary") or summary(p),
-            "confidence": level if level in ("high", "medium", "low") else "missing"}
+            # Preserve the 0.1.0 string contract; full evidence is additive.
+            "confidence": level if level in ("high", "medium", "low") else "missing",
+            "confidence_detail": confidence}
     known = {"mint", "p_crash_60m", "summary", "confidence", "kind", "band", "resq_sol", "age_min",
              "ret_5", "ret_60", "dd_60", "trades_5", "symbol", "name", "image_uri",
-             "chain", "chain_name", "platform", "market_status", "asset"}
+             "chain", "chain_name", "platform", "market_status", "asset",
+             "already_crashed", "note", "alert"}
     if row.keys() - known:
         output["warning"] = "Additional source row fields are included; their meaning has not been interpreted."
     return output
@@ -200,7 +239,7 @@ class Service:
             return result(**operation())
         except Exception as exc:
             return result(error="free_request_failed", message="Free request failed; nothing signed.",
-                          http_status=exc.status if isinstance(exc, HodlOddsError) else None)
+                          **error_details(exc))
 
     def paid(self, operation, *, board=False):
         with self.ledger.lock:
@@ -212,6 +251,13 @@ class Service:
                 answer = operation()
                 data = answer.data
                 common = {key: data.get(key) for key in ("as_of", "horizon_end", "issued_at", "expires_at")}
+                # Keep public evidence and last-known freshness; never turn a
+                # historical answer into an apparently current one by omission.
+                common.update({key: data[key] for key in (
+                    "schema", "covered", "definition", "coverage", "model", "model_id", "model_hashes",
+                    "stale", "age_s", "freshness", "horizon_remaining_s",
+                    "sort", "filters", "defaults_applied", "limit", "returned", "total_matches",
+                    "price_usdc", "unit_price_usdc") if key in data})
                 common.update(payment=receipt(answer.payment), **self.ledger.fields())
                 if board:
                     rows = [odds_row(row) for row in data["rows"]]
@@ -236,9 +282,9 @@ class Service:
                 if payment is not None and payment.get("charged") is not False:
                     self.ledger.paused = receipt(payment)
                     return result(error="payments_paused", message=RECONCILE,
-                                  payment=self.ledger.paused, **self.ledger.fields())
+                                  payment=self.ledger.paused, **error_details(exc), **self.ledger.fields())
                 return result(error="paid_request_failed", message="Request refused or unavailable; no payment charged.",
-                              http_status=exc.status if isinstance(exc, HodlOddsError) else None,
+                              **error_details(exc),
                               payment=receipt(payment), **self.ledger.fields())
 
 
@@ -274,25 +320,30 @@ def create_server():
                       crash="A crash is a completed one-minute close in SOL at least 90% below the reference price within the displayed 60-minute window.")
 
     if service.config.keypair:
-        @server.tool(description="Paid 60-minute crash odds for one covered Solana token, with confidence, timestamps, receipt and process spend.")
+        @server.tool(description="Paid 60-minute crash odds for one covered Solana token (0.01 USDC), with confidence, timestamps, receipt and process spend.")
         async def crash_odds(mint: str, chain: str | list[str] | None = None, platform: str | list[str] | None = None) -> dict[str, Any]:
             return await anyio.to_thread.run_sync(partial(service.paid, partial(service.client.risk, mint, chain=chain, platform=platform)))
 
-        @server.tool(description="Paid ranked covered Solana tokens or a watchlist of 1..100 distinct mints, with omitted-mint reasons, receipt and process spend. Price is 0.005 USDC per delivered row.")
+        @server.tool(description="Last-known crash odds for one covered Solana token (0.002 USDC), at most 30 minutes old, labelled with freshness/age and a reduced confidence level when stale. The original forecast window is unchanged; shares the session budget and payment pause rules.")
+        async def last_known(mint: str, chain: str | list[str] | None = None, platform: str | list[str] | None = None) -> dict[str, Any]:
+            return await anyio.to_thread.run_sync(partial(service.paid, partial(service.client.last, mint, chain=chain, platform=platform)))
+
+        @server.tool(description="Paid ranked covered Solana tokens or a watchlist of 1..100 distinct mints, with omitted-mint reasons, receipt and process spend. Price is 0.005 USDC per delivered row. lowest_risk (alias safest) defaults to min_trades_5=3 and include_crashed=false; explicit filters override these defaults, and watchlists get neither default.")
         async def board(
             limit: int | None = None,
-            sort: Literal["lowest_risk", "riskiest", "liquidity", "newest", "active"] = "lowest_risk",
+            sort: Literal["lowest_risk", "safest", "riskiest", "liquidity", "newest", "active"] = "lowest_risk",
             max_risk: float | None = None, min_risk: float | None = None,
             min_liquidity_sol: float | None = None,
             min_age_min: float | None = None, max_age_min: float | None = None,
             min_trades_5: int | None = None,
             min_confidence: Literal["high", "medium", "low"] | None = None,
+            include_crashed: bool | None = None,
             mints: list[str] | None = None,
             chain: str | list[str] | None = None, platform: str | list[str] | None = None,
         ) -> dict[str, Any]:
             filters = {key: value for key, value in locals().items()
                        if key in ("max_risk", "min_risk", "min_liquidity_sol", "min_age_min", "max_age_min",
-                                  "min_trades_5", "min_confidence") and value is not None}
+                                  "min_trades_5", "min_confidence", "include_crashed") and value is not None}
             operation = partial(service.client.board, limit=limit, sort=sort, mints=mints,
                                 max_price_usdc=usdc(service.config.max_atomic), chain=chain, platform=platform, **filters)
             # Default run_sync cancellation shielding keeps settlement accounting alive

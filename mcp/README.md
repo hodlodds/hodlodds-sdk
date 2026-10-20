@@ -6,6 +6,8 @@ tools use x402 USDC on Solana or Base with per-call and per-session spending
 limits. Paying on Base does not change the data universe: current paid scores
 cover active SOL-quoted pump.fun graduates.
 
+Source: [HodlOdds SDK and MCP public repository](https://github.com/hodlodds/hodlodds-sdk/tree/main/mcp).
+
 ## Install
 
 ```sh
@@ -15,7 +17,7 @@ hodlodds-mcp
 uvx hodlodds-mcp
 ```
 
-Python 3.11+ is required. Dependencies are `hodlodds>=0.3.0,<0.4` and
+Python 3.11+ is required. Dependencies are `hodlodds>=0.3.1,<0.4` and
 `mcp>=2.3,<3`. The HodlOdds client supplies its pinned x402 dependencies. This
 package starts a local process, not an HTTP MCP endpoint. Stdout is reserved
 for MCP protocol messages.
@@ -29,22 +31,34 @@ for MCP protocol messages.
 | `coverage(mint)` | Free | Observed coverage stage, reason and source timestamp |
 | `meaning()` | Free, offline | Crash definition, confidence interpretation and freshness rules |
 | `crash_odds(mint)` | 0.01 per delivered answer | Crash probability, summary, confidence, forecast timestamps, receipt and budget |
+| `last_known(mint)` | 0.002 per delivered answer | Labelled last-known odds, at most 30 minutes old, with freshness, age, receipt and budget |
 | `board(...)` | 0.005 per delivered coin; empty results free | Ranked rows or a watchlist, omitted-mint facts, timestamps, receipt and budget |
 
-The separate HTTP API's `/v1/risk/{mint}/last` costs 0.002 USDC for last-known
-odds at most 30 minutes old. **Version 0.1.0 exposes no last-known MCP tool**;
-use the Python SDK's `last()` method directly if you explicitly want that route.
+`last_known` explicitly opts into the SDK's `last()` route. It can also be used
+while the feed is live. Its `stale`, `freshness`, `age_s` and
+`horizon_remaining_s` fields preserve the original forecast window; paying
+does not restart it. When stale, confidence is downgraded one level. The same
+per-call cap, session budget and uncertain-payment pause apply to all paid tools.
 
 `board` accepts `limit`, `sort`, `max_risk`, `min_risk`, `min_liquidity_sol`,
-`min_age_min`, `max_age_min`, `min_trades_5`, `min_confidence`, `mints`, `chain`
-and `platform`. Sorts are `lowest_risk` (default), `riskiest`, `liquidity`,
+`min_age_min`, `max_age_min`, `min_trades_5`, `min_confidence`, `include_crashed`,
+`mints`, `chain` and `platform`. Sorts are `lowest_risk` (default), `safest`
+(an alias for `lowest_risk`), `riskiest`, `liquidity`,
 `newest` and `active`. Without `mints`, limits are 10–500 (default 50).
 With a watchlist of 1–100 distinct Solana mint addresses, the default limit is
 its length and explicit limits are 1–100. Only returned coins are charged.
 `not_delivered` contains coverage/filter facts for omitted mints, not inferred
 odds. Probability filters use 0–1; confidence is `high`, `medium` or `low`.
 
-`crash_odds`, `board` and `coverage` accept optional `chain` and `platform`
+For `lowest_risk`/`safest`, omitted filters default server-side to
+`min_trades_5=3` and `include_crashed=false`. Explicit values override them,
+including `min_trades_5=0` and `include_crashed=true`. Watchlists get **neither
+default**: your crashed holdings stay visible and flagged unless explicitly
+filtered out. The offer binds the client's parameters without these defaults;
+the server applies them deterministically when selecting and pricing rows.
+Answers retain `filters`, `defaults_applied` and `total_matches`.
+
+`crash_odds`, `last_known`, `board` and `coverage` accept optional `chain` and `platform`
 strings, comma-separated strings or lists. Currently use `chain="solana"`
 or its CAIP-2 ID and `platform="pumpfun"`; `pump` and `pump.fun` are aliases.
 Values are case-insensitive; empty, duplicate and unsupported values are
@@ -52,8 +66,16 @@ refused before payment. Use `markets()` to check current availability. Data
 markets and payment networks are separate choices.
 
 Every result includes “Odds, not guarantees. Not financial advice.” Errors
-have MCP `isError: true` and a structured error code. Missing confidence is
-reported as `missing`. Receipts contain public payment details, not signed
+have MCP `isError: true`, a structured error code and `http_status` when known.
+Recognized public server messages are exposed as `server_error` and
+`server_code` (such as `offer_changed`); arbitrary rejected content is not
+echoed. As in 0.1.0, `confidence` remains the level string:
+`high`, `medium`, `low`, or `missing`. The new `confidence_detail` field
+retains the full server object, including `reasons` and its band evidence
+(an empty object when absent). The row's `band` evidence also passes through.
+Model IDs/hashes, `alert` when supplied, `already_crashed` and `note` also pass
+through. Only undocumented row fields add an extra-fields warning.
+Receipts contain public payment details, not signed
 authorizations or key contents. Spending is tracked in integer atomic USDC;
 displayed USDC amounts are exact decimal strings.
 
@@ -141,6 +163,14 @@ indicate success or a transaction. A conflicting or malformed receipt remains
 uncertain. Confirmed free refusals refund the reservation, return an error and
 leave payments enabled.
 
+For a board `409` with `code: "offer_changed"`, the SDK can request a new
+offer once **before signing only**, with the same query and repeated price
+and budget checks. A signed request is never retried automatically. After signing,
+a `409` with `code: "offer_changed"` and `HodlOdds-Charged: no` (without a conflicting
+receipt) means nothing was charged, but the client must call again; the SDK never
+re-signs on its own. A second automatic authorization could be settled twice
+if a server misbehaved. The free refusal releases the budget reservation.
+
 After an uncertain payment—such as a lost response, missing receipt or
 conflicting receipt—**all further paid calls pause**. The reserved amount stays
 spent until the operator reconciles it against finalized wallet history and
@@ -168,22 +198,31 @@ not a token-specific interval or guarantee. Missing odds, missing confidence,
 stale data and uncovered tokens are not safety signals. Very low odds say
 “under 0.1%”, never a rounded zero.
 
+`dd_60` is close divided by the maximum close in the previous 60 minutes,
+minus one. Zero is the hour's high. At `-0.90` or lower, `already_crashed`
+is true and the row's `note` and `summary` warn that little may be left to
+fall. Unknown drawdown gives a null flag. This is a past-price fact, not a
+new model prediction. Below about 2%, historical crash rates have run up to
+about twice the predicted value, under one percentage point in absolute
+terms; those answers carry low confidence.
+
 Odds, not guarantees. Not financial advice.
 
 ## Development
 
-From the public repository root, with the dependencies and pytest installed:
+From the [public repository](https://github.com/hodlodds/hodlodds-sdk) root,
+with the dependencies and pytest installed:
 
 ```sh
 python -m pytest -q mcp/tests
 python -m build mcp
 ```
 
-Tests use the installed public HodlOdds package, mocked HTTP and signing, and
+Tests use this checkout's SDK and MCP sources, mocked HTTP and signing, and
 an in-memory MCP session. Socket connections and DNS lookups are disabled.
 They do not prove live settlement or desktop-client integration. The budget
 adapter uses the SDK's watch accounting hook, so the dependency is bounded to
-`hodlodds>=0.3.0,<0.4` and tested before upgrades.
+`hodlodds>=0.3.1,<0.4` and tested before upgrades.
 
 `server.json` contains registry metadata for `com.hodlodds/hodlodds-mcp`.
 Publishing to PyPI and publishing a registry listing are separate steps;

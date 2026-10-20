@@ -13,7 +13,7 @@ from hodlodds import client as sdk
 from mcp.client._memory import InMemoryTransport
 from mcp.client.session import ClientSession
 
-from hodlodds_mcp.server import Config, DISCLAIMER, FRESHNESS, MEANING, create_server, main, summary
+from hodlodds_mcp.server import Config, DISCLAIMER, FRESHNESS, MEANING, create_server, error_details, main, odds_row, summary
 
 MINT = "CY8tK7zPvoRAL5tugvxBEgFEtrgAXiikTAKVgh61Siq5"
 OTHER = "GrbVMxp8NHbeMq4WhpD1gwBX4ftCB21ZvfdB5viZhSry"
@@ -53,6 +53,7 @@ def api(monkeypatch, tmp_path):
     key.chmod(0o600)
     state = SimpleNamespace(loads=0, signs=0, requests=[], behavior="ok", amount=10000,
                             rows=1, summary=True, invalid_binding=False, key=key,
+                            row_fields={}, answer_fields={}, error_body=None, initial_changes=0,
                             started=threading.Event(), release=threading.Event())
     net = sdk._network_config("devnet")
     monkeypatch.setenv("HODLODDS_BASE_URL", "http://localhost:8010")
@@ -72,20 +73,27 @@ def api(monkeypatch, tmp_path):
             return httpx.Response(200, json={"mint": path.rsplit("/", 1)[-1], "stage": "unknown",
                                              "reason": "Not observed", "as_of": 1800000000})
         is_board = path == "/v1/board"
+        is_last = path.endswith("/last")
         if state.behavior == "free":
-            return httpx.Response(404, json={"error": SECRET + SIGNED})
+            return httpx.Response(404, json=state.error_body or {"error": SECRET + SIGNED})
         if is_board and state.behavior == "empty":
             return httpx.Response(200, json={"rows": [], "not_delivered": [
                 {"mint": MINT, "stage": "unknown", "reason": "Not observed"}]})
-        amount = state.rows * 5000 if is_board else state.amount
+        amount = state.rows * 5000 if is_board else 2000 if is_last else state.amount
         if "payment-signature" not in request.headers:
+            if is_board and state.initial_changes:
+                state.initial_changes -= 1
+                return httpx.Response(409, headers={"HodlOdds-Charged": "no"},
+                                      json={"error": "matches changed; request again", "code": "offer_changed",
+                                            "charged": False})
             extra = {"paymentFlow": "authorization", "feePayer": "11111111111111111111111111111111"}
             if is_board:
                 params = dict(request.url.params)
                 mints = params.pop("mints", None)
                 markets = {k + "s": params.pop(k).split(",") for k in ("chain", "platform") if k in params}
                 query = {"limit": int(params.pop("limit")), "sort": params.pop("sort"),
-                         "filters": {k: v if k == "min_confidence" else float(v) for k, v in params.items()}}
+                         "filters": {k: v if k == "min_confidence" else v == "true" if k == "include_crashed"
+                                     else int(v) if k == "min_trades_5" else float(v) for k, v in params.items()}}
                 query.update(markets)
                 if mints:
                     query.update(mints_sha256=hashlib.sha256(mints.encode()).hexdigest(), mints_count=len(mints.split(",")))
@@ -112,7 +120,8 @@ def api(monkeypatch, tmp_path):
                 headers["PAYMENT-RESPONSE"] = encoded({"success": True, "network": net["caip2"], "transaction": TX})
             if state.behavior == "malformed":
                 headers["PAYMENT-RESPONSE"] = "not-base64"
-            return httpx.Response(409, headers=headers, json={"error": SECRET + SIGNED + str(key), "charged": False})
+            return httpx.Response(409, headers=headers, json=state.error_body or {
+                "error": SECRET + SIGNED + str(key), "charged": False})
         row = {"mint": MINT, "p_crash_60m": 0.04, "confidence": {"level": "high"}}
         if state.behavior == "extended":
             row.update(chain=sdk.AVAILABLE_CHAINS["solana"], platform="pumpfun", future_field={"value": 1})
@@ -120,7 +129,11 @@ def api(monkeypatch, tmp_path):
             row.pop("p_crash_60m")
         if state.summary:
             row["summary"] = summary(0.04)
+        row.update(state.row_fields)
         data = {"as_of": 1800000000, "horizon_end": 1800003600, "issued_at": 1800000020, "expires_at": 1800000140}
+        if is_last:
+            data.update(stale=True, age_s=300, freshness="stale", horizon_remaining_s=3280)
+        data.update(state.answer_fields)
         if is_board:
             data.update(rows=[dict(row) for _ in range(state.rows)], not_delivered=[
                 {"mint": OTHER, "stage": "unknown", "reason": "Not observed"}])
@@ -159,7 +172,7 @@ async def test_listing_and_free_tools(api, monkeypatch, keyed):
         monkeypatch.delenv("HODLODDS_SESSION_BUDGET_USDC")
     async with session(create_server()) as client:
         names = {tool.name for tool in (await client.list_tools()).tools}
-        assert names == {"status", "coverage", "meaning", "markets"} | ({"crash_odds", "board"} if keyed else set())
+        assert names == {"status", "coverage", "meaning", "markets"} | ({"crash_odds", "last_known", "board"} if keyed else set())
         assert (await call(client, "status"))["age_s"] == 20
         assert (await call(client, "markets"))["markets"][0]["platform"] == "pumpfun"
         assert (await call(client, "coverage", mint=MINT))["stage"] == "unknown"
@@ -177,6 +190,7 @@ async def test_paid_crash_odds(api, has_summary):
         data = await call(client, "crash_odds", mint=MINT)
     assert data["mint"] == MINT and data["p_crash_60m"] == 0.04
     assert data["summary"] == summary(0.04) and data["confidence"] == "high"
+    assert data["confidence_detail"] == {"level": "high"}
     assert data["horizon_end"] - data["as_of"] == 3600
     assert data["payment"]["transaction"] == TX and data["payment"]["network"] == "devnet"
     assert data["payment"]["amount_usdc"] == "0.01"
@@ -214,7 +228,8 @@ async def test_ambiguous_pauses_only_paid_calls(api, behavior, capsys):
         assert "Restart only after checking the wallet" in data["message"]
         assert data["payment"]["payer"] == PAYER and data["payment"]["pay_to"] == PAYTO
         before = len(api.requests)
-        for name, args in (("crash_odds", {"mint": MINT}), ("board", {"mints": [MINT]})):
+        for name, args in (("crash_odds", {"mint": MINT}), ("last_known", {"mint": MINT}),
+                           ("board", {"mints": [MINT]})):
             assert (await call(client, name, **args))["payment"] == data["payment"]
         assert len(api.requests) == before
         assert (await call(client, "status"))["state"] == "live"
@@ -418,3 +433,204 @@ async def test_settled_row_shape_never_pauses_payments(api, tool, args, shape):
         second = await call(client, tool, **args)
         assert "error" not in second
         assert api.signs == 2
+
+
+@pytest.mark.anyio
+async def test_last_known_freshness_and_shared_budget(api, monkeypatch):
+    monkeypatch.setenv("HODLODDS_SESSION_BUDGET_USDC", "0.017")
+    async with session(create_server()) as client:
+        await call(client, "crash_odds", mint=MINT)
+        data = await call(client, "last_known", mint=MINT, chain="solana", platform="pumpfun")
+        assert data["stale"] is True and data["freshness"] == "stale"
+        assert data["age_s"] == 300 and data["horizon_remaining_s"] == 3280
+        assert data["payment"]["amount_usdc"] == "0.002"
+        assert data["spent_atomic"] == 12000
+        assert api.requests[-1].url.path == "/v1/risk/" + MINT + "/last"
+        assert api.requests[-1].url.params["platform"] == "pumpfun"
+        assert (await call(client, "board", mints=[MINT]))["spent_atomic"] == 17000
+        assert (await call(client, "last_known", mint=MINT))["error"] == "budget_exhausted"
+    assert api.signs == api.loads == 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("variable,value,expected", [
+    ("HODLODDS_MAX_PRICE_USDC", "0.001999", "paid_request_failed"),
+    ("HODLODDS_SESSION_BUDGET_USDC", "0.001999", "budget_exhausted"),
+])
+async def test_last_known_limits_before_key_access(api, monkeypatch, variable, value, expected):
+    monkeypatch.setenv(variable, value)
+    async with session(create_server()) as client:
+        data = await call(client, "last_known", mint=MINT)
+    assert data["error"] == expected and data["spent_atomic"] == 0
+    assert api.signs == api.loads == 0
+
+
+@pytest.mark.anyio
+async def test_last_known_uncertainty_pauses_every_paid_tool(api):
+    api.behavior = "lost"
+    async with session(create_server()) as client:
+        data = await call(client, "last_known", mint=MINT)
+        assert data["error"] == "payments_paused" and data["spent_atomic"] == 2000
+        before = len(api.requests)
+        for tool, args in (("crash_odds", {"mint": MINT}), ("last_known", {"mint": MINT}),
+                           ("board", {"mints": [MINT]})):
+            assert (await call(client, tool, **args))["error"] == "payments_paused"
+        assert len(api.requests) == before
+    assert api.signs == 1
+
+
+@pytest.mark.anyio
+async def test_last_known_confirmed_free_refusal_keeps_budget(api, monkeypatch):
+    monkeypatch.setenv("HODLODDS_SESSION_BUDGET_USDC", "0.002")
+    api.behavior = "refused"
+    async with session(create_server()) as client:
+        data = await call(client, "last_known", mint=MINT)
+        assert data["error"] == "paid_request_failed" and data["spent_atomic"] == 0
+        assert data["payment"]["charged"] is False
+        api.behavior = "ok"
+        assert (await call(client, "last_known", mint=MINT))["spent_atomic"] == 2000
+    assert api.signs == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tool,args", [
+    ("crash_odds", {"mint": MINT}), ("last_known", {"mint": MINT}), ("board", {"mints": [MINT]})
+])
+async def test_all_documented_evidence_survives_without_unknown_warning(api, tool, args):
+    band = {"lo": .005, "hi": .01, "n": 33234, "pred": .0073, "obs": .0133,
+            "historical_observed": .0133, "basis": "Historical weekly refits"}
+    confidence = {"level": "low", "reasons": ["historical under-prediction"], "band": band,
+                  "basis": "Historical weekly refits", "direction": "historically under-predicted"}
+    note = ("This token already fell 90% or more within the last hour; a low number now means "
+            "little is left to fall, not that it is safe.")
+    api.row_fields = {"confidence": confidence, "band": band, "already_crashed": True,
+                      "note": note, "alert": False, "dd_60": -.99, "symbol": "TEST",
+                      "name": "Example token", "resq_sol": 120, "age_min": 1440,
+                      "ret_5": -.95, "ret_60": -.99, "trades_5": 3, "kind": "sol",
+                      "chain": sdk.AVAILABLE_CHAINS["solana"], "chain_name": "Solana",
+                      "platform": "pumpfun", "market_status": "available", "asset": "SOL"}
+    api.answer_fields = {"model": {"id": "example-model", "hashes": {"model": "a" * 64}},
+                         "definition": "Example event definition", "covered": True,
+                         "coverage": {"universe": "SOL-quoted pump.fun graduates"}}
+    if tool == "board":
+        api.answer_fields.update(sort="lowest_risk", total_matches=37, returned=1, limit=1,
+                                 filters={"include_crashed": True}, defaults_applied={},
+                                 unit_price_usdc="0.005", price_usdc="0.005")
+    async with session(create_server()) as client:
+        data = await call(client, tool, **args)
+    row = data["rows"][0] if tool == "board" else data
+    assert row["confidence"] == "low" and row["confidence_detail"] == confidence
+    for name, value in api.row_fields.items():
+        assert row["confidence_detail" if name == "confidence" else name] == value
+    for name, value in api.answer_fields.items():
+        assert data[name] == value
+    assert "warning" not in row and "warning" not in data
+
+
+@pytest.mark.parametrize("confidence,level", [
+    ({"level": "high", "reasons": ["historical evidence"]}, "high"),
+    ({"level": "medium", "reasons": ["young token"]}, "medium"),
+    ({"level": "low", "reasons": ["historical under-prediction"]}, "low"),
+    ({"level": "unknown", "reasons": ["unvalidated"]}, "missing"),
+    ({}, "missing"), (None, "missing"),
+])
+def test_0_1_row_contract_preserved_with_additive_confidence_detail(confidence, level):
+    source = {"mint": MINT, "p_crash_60m": .04, "confidence": confidence,
+              "dd_60": -.1, "band": {"lo": .02, "hi": .05, "historical_observed": .038}}
+    # Golden 0.1.0 output for the same source, including its string confidence.
+    legacy = {**source, "odds_percent": 4., "summary": summary(.04), "confidence": level}
+    actual = odds_row(source)
+    assert isinstance(actual["confidence"], str)
+    assert actual["confidence_detail"] == (confidence or {})
+    assert {key: value for key, value in actual.items() if key != "confidence_detail"} == legacy
+    assert "confidence_level" not in actual
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("include", [None, False, True])
+async def test_board_new_filter_alias_and_explicit_zero(api, include):
+    api.answer_fields = {"filters": {"min_trades_5": 0}, "defaults_applied": {}, "total_matches": 1}
+    args = {"min_trades_5": 0, "sort": "safest", "mints": [MINT]}
+    if include is not None:
+        args["include_crashed"] = include
+        api.answer_fields["filters"]["include_crashed"] = include
+    async with session(create_server()) as client:
+        tools = {item.name: item for item in (await client.list_tools()).tools}
+        assert "include_crashed" in tools["board"].input_schema["properties"]
+        data = await call(client, "board", **args)
+    assert "error" not in data
+    assert api.requests[0].url.params["min_trades_5"] == "0"
+    assert api.requests[0].url.params["sort"] == "safest"
+    if include is None:
+        assert "include_crashed" not in api.requests[0].url.params
+    else:
+        assert api.requests[0].url.params["include_crashed"] == str(include).lower()
+    assert data["filters"] == api.answer_fields["filters"]
+    assert data["defaults_applied"] == {} and data["total_matches"] == 1
+
+
+@pytest.mark.anyio
+async def test_board_effective_defaults_are_preserved(api):
+    api.answer_fields = {"filters": {"min_trades_5": 3, "include_crashed": False},
+                         "defaults_applied": {"min_trades_5": 3, "include_crashed": False,
+                                              "reason": "Low-risk defaults applied"}, "total_matches": 17}
+    async with session(create_server()) as client:
+        data = await call(client, "board", limit=10)
+    assert "error" not in data
+    assert "min_trades_5" not in api.requests[0].url.params
+    assert "include_crashed" not in api.requests[0].url.params
+    for key in api.answer_fields:
+        assert data[key] == api.answer_fields[key]
+
+
+@pytest.mark.anyio
+async def test_offer_changed_refusal_is_structured_and_never_retried_after_signing(api):
+    api.behavior = "refused"
+    api.error_body = {"error": "matches changed; request again", "code": "offer_changed", "charged": False,
+                      "untrusted_debug": SECRET + SIGNED}
+    async with session(create_server()) as client:
+        data = await call(client, "board", mints=[MINT])
+    assert data["error"] == "paid_request_failed" and data["http_status"] == 409
+    assert data["server_code"] == "offer_changed"
+    assert data["server_error"] == "matches changed; request again"
+    assert data["spent_atomic"] == 0 and api.signs == 1 and len(api.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_unsigned_board_offer_refresh_is_shared_sdk_path_and_single_charge(api, monkeypatch):
+    monkeypatch.setenv("HODLODDS_SESSION_BUDGET_USDC", "0.005")
+    api.initial_changes = 1
+    async with session(create_server()) as client:
+        data = await call(client, "board", mints=[MINT])
+        assert "error" not in data
+        assert data["spent_atomic"] == data["budget_atomic"] == 5000
+        assert api.signs == api.loads == 1 and len(api.requests) == 3
+        assert all("payment-signature" not in request.headers for request in api.requests[:2])
+        assert api.requests[0].url == api.requests[1].url == api.requests[2].url
+        assert (await call(client, "last_known", mint=MINT))["error"] == "budget_exhausted"
+    assert api.signs == api.loads == 1
+
+
+@pytest.mark.anyio
+async def test_unsigned_board_offer_refresh_stops_once_without_spending_or_pausing(api):
+    api.initial_changes = 2
+    async with session(create_server()) as client:
+        data = await call(client, "board", mints=[MINT])
+        assert data["error"] == "paid_request_failed" and data["http_status"] == 409
+        assert data["server_code"] == "offer_changed" and data["spent_atomic"] == 0
+        assert len(api.requests) == 2 and api.signs == api.loads == 0
+        assert "error" not in await call(client, "board", mints=[MINT])
+    assert api.signs == api.loads == 1
+
+
+@pytest.mark.parametrize("body,expected", [
+    ({"error": "sort must be one of: lowest_risk, safest, riskiest, liquidity, newest, active"},
+     {"server_error": "sort must be one of: lowest_risk, safest, riskiest, liquidity, newest, active"}),
+    ({"error": "min_trades_5 must be an integer"}, {"server_error": "min_trades_5 must be an integer"}),
+    ({"error": SECRET + SIGNED, "code": SECRET}, {}),
+    ({"error": "sort must be one of: " + SECRET}, {}),
+    ({"error": {"key": SECRET}, "code": "offer_changed"}, {"server_code": "offer_changed"}),
+])
+def test_server_error_allowlist_never_echoes_rejected_secrets(body, expected):
+    exc = sdk.HodlOddsError(SECRET + SIGNED, status=400, body=body)
+    assert error_details(exc) == {"http_status": 400, **expected}

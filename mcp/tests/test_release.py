@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tomllib
 
+import hodlodds
 from hodlodds_mcp import __version__
 
 
@@ -14,10 +15,21 @@ REPO = PACKAGE.parent
 def test_package_dependency_bounds_and_entry_point():
     project = tomllib.loads((PACKAGE / "pyproject.toml").read_text())["project"]
     assert project["name"] == "hodlodds-mcp"
-    assert project["version"] == __version__ == "0.1.0"
+    assert project["version"] == __version__ == "0.2.0"
     assert project["requires-python"] == ">=3.11"
-    assert project["dependencies"] == ["hodlodds>=0.3.0,<0.4", "mcp>=2.3,<3"]
+    assert project["dependencies"] == ["hodlodds>=0.3.1,<0.4", "mcp>=2.3,<3"]
     assert project["scripts"] == {"hodlodds-mcp": "hodlodds_mcp.server:main"}
+    assert project["authors"] == [{"name": "HodlOdds"}]
+    assert project["urls"] == {
+        "Homepage": "https://hodlodds.com",
+        "Source": "https://github.com/hodlodds/hodlodds-sdk/tree/main/mcp",
+        "Documentation": "https://api.hodlodds.com/docs",
+    }
+    sdk = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]
+    assert project["classifiers"] == sdk["classifiers"]
+    assert sdk["version"] == hodlodds.__version__ == "0.3.1"
+    assert sdk["requires-python"] == ">=3.10"
+    assert Path(hodlodds.__file__).resolve() == REPO / "hodlodds/__init__.py"
 
 
 def test_registry_metadata_matches_distribution():
@@ -43,8 +55,8 @@ def test_release_workflows_keep_sdk_and_mcp_artifacts_separate():
     sdk_workflow = (REPO / ".github/workflows/publish.yml").read_text()
     assert 'tags: ["mcp-v*"]' in workflow
     assert 'tags: ["v*"]' in sdk_workflow
-    assert fnmatch.fnmatchcase("mcp-v0.1.0", "mcp-v*")
-    assert not fnmatch.fnmatchcase("mcp-v0.1.0", "v*")
+    assert fnmatch.fnmatchcase("mcp-v0.2.0", "mcp-v*")
+    assert not fnmatch.fnmatchcase("mcp-v0.2.0", "v*")
     assert "environment: pypi-mcp" in workflow
     assert "id-token: write" in workflow
     assert "python -m build mcp" in workflow
@@ -52,11 +64,42 @@ def test_release_workflows_keep_sdk_and_mcp_artifacts_separate():
     assert "packages-dir: mcp/dist/" in workflow
 
 
-def test_public_instructions_do_not_advertise_an_unimplemented_last_tool():
+def test_public_instructions_describe_last_tool_defaults_and_payment_safety():
     readme = (PACKAGE / "README.md").read_text()
     assert "pip install hodlodds-mcp" in readme
     assert "uvx hodlodds-mcp" in readme
-    assert "/v1/risk/{mint}/last` costs 0.002" in readme
-    assert "exposes no last-known MCP tool" in readme
+    assert "| `last_known(mint)` | 0.002" in readme
+    assert "https://github.com/hodlodds/hodlodds-sdk/tree/main/mcp" in readme
+    for field in ("dd_60", "already_crashed", "note", "confidence_detail",
+                  "defaults_applied", "total_matches", "server_code", "offer_changed",
+                  "include_crashed", "safest"):
+        assert field in readme
+    assert "Watchlists get **neither" in readme
+    assert "**before signing only**" in readme
+    assert "A signed request is never retried automatically" in readme
+    assert "`confidence` remains the level string" in readme
+    assert "`high`, `medium`, `low`, or `missing`" in readme
     assert "Odds, not guarantees. Not financial advice." in readme
     assert "R80" not in readme and "sdk/python" not in readme
+
+
+def test_sdk_public_instructions_describe_current_board_and_last_behaviour():
+    readme = (REPO / "README.md").read_text()
+    for field in ("dd_60", "already_crashed", "note", "defaults_applied",
+                  "include_crashed", "--include-crashed", "offer_changed",
+                  "client.last", "safest"):
+        assert field in readme
+    assert "neither default" in readme
+    assert "**once only if the" in readme and "409 occurs before signing**" in readme
+    assert "**never retried automatically**" in readme
+    assert "after the first mcp-v0.1.0 release" not in readme
+
+
+def test_both_readmes_explain_signed_offer_changed_safety():
+    for path in (REPO / "README.md", PACKAGE / "README.md"):
+        text = " ".join(path.read_text().split())
+        assert 'code: "offer_changed"' in text
+        assert "HodlOdds-Charged: no" in text
+        assert "nothing was charged, but the client must call again" in text
+        assert "the SDK never re-signs on its own" in text
+        assert "A second automatic authorization could be settled twice if a server misbehaved." in text
