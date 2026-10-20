@@ -25,8 +25,13 @@ how well past predictions in that probability range matched reality.
 60 minutes, minus one. Zero means the token is at that hour's high;
 `dd_60 <= -0.90` means it has already fallen at least 90% within the hour.
 Rows expose `already_crashed` (`true`, `false`, or `null` when the drawdown
-is unknown). A true value also carries a `note` and a warning in `summary`:
-a low crash probability after a collapse is not a recovery or safety signal.
+is unknown); an older collapse reads `false`. `crashed_within_24h` and
+`last_crash_as_of` say whether an API snapshot saw `dd_60 <= -0.90` for the
+token within the last 24 hours, and the latest such snapshot time (UTC epoch
+seconds). This memory only sees snapshots the API received, not outages, and
+both fields are `null` while it is unavailable. Either crash flag adds a `note`
+and crash context in `summary`: a low crash probability after a collapse is not
+a recovery or safety signal.
 Below about 2%, observed crash rates have run up to about twice the predicted
 value, under one percentage point in absolute terms; those answers carry
 `confidence: low`.
@@ -61,7 +66,7 @@ pip install hodlodds                                        # from PyPI
 pip install "git+https://github.com/hodlodds/hodlodds-sdk"  # or the latest main
 ```
 
-Python 3.10+. Dependencies: `httpx` and the official `x402[svm,evm]==2.25.0` SDK (pinned).
+Python 3.10+. Dependencies: `httpx`, `certifi>=2026.10.19` and the official `x402[svm,evm]==2.25.0` SDK (pinned).
 
 ## MCP server
 
@@ -128,6 +133,9 @@ The total price is `0.005 × coins returned`; pass `max_price_usdc` in Python or
 `--max-price` on the CLI at least that high. The default per-call maximum is
 0.01 USDC, so boards normally need an explicit higher limit. The hard cap is
 2.5 USDC **for board calls only** and 1 USDC for individual risk/last calls.
+Above your limit the client raises `PriceLimitError` (a `HodlOddsError`) before
+signing; its `price_atomic` and `limit_atomic` give the offered total and your
+limit in USDC atomic units (1 USDC = 1,000,000).
 `min_trades_5` accepts integers from 0 through 9223372036854775807.
 
 Compatibility: the 0.2.0 `safest` sort remains accepted as an alias for
@@ -135,19 +143,27 @@ Compatibility: the 0.2.0 `safest` sort remains accepted as an alias for
 These older spellings are deprecated in examples; existing calls keep working.
 
 For `lowest_risk` and its `safest` alias, the server applies
-`min_trades_5=3` and `include_crashed=false` when those filters are omitted,
-so barely traded or already-collapsed tokens do not dominate the list.
-Explicit values override the defaults, including `min_trades_5=0` and
-`include_crashed=True` (CLI: `--min-trades 0 --include-crashed`).
+`min_trades_5=3`, `min_liquidity_sol=5` and `include_crashed=false` when those
+filters are omitted, so barely traded, illiquid or recently collapsed tokens
+do not dominate the list. The crash filter excludes both `already_crashed` and
+`crashed_within_24h` rows. Explicit values override the defaults, including
+`min_trades_5=0`, `min_liquidity_sol=0` and `include_crashed=True`
+(CLI: `--min-trades 0 --min-liquidity 0 --include-crashed`).
 Other sorts keep their existing selection. An explicit `mints=` watchlist
-gets **neither default**: crashed holdings remain visible and flagged unless
-you explicitly request `include_crashed=False`.
+gets **none of these defaults**: crashed holdings remain visible and flagged
+unless you explicitly request `include_crashed=False`.
 
-Board answers return effective `filters` and `defaults_applied`, which is
-empty when no default was added. The offer binds exactly the client's own
-normalized parameters. The server applies its documented defaults
-deterministically when selecting and pricing rows; the client does not add
-those defaults to the signed query.
+The lowest odds are usually the least-traded tokens; the default filters remove most inactive or recently collapsed tokens, not all.
+
+Board answers return effective `filters`, `defaults_applied` (empty when no
+default was added) and `excluded_by_defaults`, the number of rows removed only
+by those defaults before the limit. The 402 offer body shows the same two
+fields; they are not part of the signed offer. If the API's recent-crash memory
+is unavailable, the defaults reason says so and the crash filter uses only
+`already_crashed`. The offer binds exactly the client's own normalized
+parameters. The server applies its documented defaults deterministically when
+selecting and pricing rows; the client does not add those defaults to the
+signed query.
 
 ```python
 board = client.board(limit=100, sort="lowest_risk", max_risk=0.05, min_liquidity_sol=50, max_price_usdc="0.5")
@@ -168,18 +184,20 @@ and `horizon_remaining_s`; buying the answer does not renew its forecast.
 
 A board `409` with `code: "offer_changed"` means the matching set changed
 between the offer and the paid request; the server marks that refusal
-`HodlOdds-Charged: no`. SDK 0.3.1 requests a new offer **once only if the
-409 occurs before signing**, with no successful or uncertain receipt. It
-uses the same query and repeats all price and budget checks. There is no
-extra spend for this unsigned offer refresh.
+`HodlOdds-Charged: no`. On the current API this 409 is returned only to a
+**signed request**, and a signed request is **never retried automatically**.
+With `HodlOdds-Charged: no` and no conflicting receipt, nothing was charged,
+but the client must call again; the SDK never re-signs on its own. In practice
+`board()` raises `HodlOddsError` with `error.payment["charged"] == False`; call
+`board()` again to get a new offer. A second automatic authorization could be
+settled twice if a server misbehaved. Watch loops treat a confirmed free
+refusal as a skip and continue on their next scheduled cycle. Uncertain
+payments stop the watch and require reconciliation.
 
-A board `409` with `code: "offer_changed"` received after a **signed request**
-is **never retried automatically**. With `HodlOdds-Charged: no` and no conflicting
-receipt, nothing was charged, but the client must call again; the SDK never
-re-signs on its own. A second automatic authorization could be settled twice
-if a server misbehaved. Watch loops treat a
-confirmed free refusal as a skip and continue on their next scheduled
-cycle. Uncertain payments stop the watch and require reconciliation.
+As a safeguard only, SDK 0.3.1 and later request a new offer **once only if the
+409 occurs before signing**, with no successful or uncertain receipt. That
+refresh uses the same query, repeats all price and budget checks, and signs
+and spends nothing.
 
 ### Watchlists and market filters
 
@@ -359,6 +377,13 @@ Exit status: `0` success, `1` refusal/API/transport failure, `2` invalid usage.
   environment proxies, bounded headers and bodies.
 - Mainnets require an explicit `network="solana"` (or `"base"`) and a pinned
   `pay_to`; the CLI requires `--network solana|base --pay-to ...` on the command line.
+
+## Security
+
+The package requires `certifi>=2026.10.19`, the TLS root bundle `httpx` uses.
+That release removes the "emSign ECC Root CA - G3" root after the CA incident
+announced on 2026-10-20; upgrade older environments with
+`pip install -U hodlodds certifi`.
 
 ## Test wallet (devnet / Base Sepolia)
 

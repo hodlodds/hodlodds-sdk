@@ -55,6 +55,17 @@ class HodlOddsError(Exception):
         self.status, self.body, self.payment = status, body, payment
 
 
+class PriceLimitError(HodlOddsError):
+    """A fully checked offer costs more than the caller's limit; nothing was signed.
+
+    price_atomic and limit_atomic are USDC atomic units (1 USDC = 1,000,000).
+    The message is unchanged from earlier releases.
+    """
+    def __init__(self, price_atomic, limit_atomic):
+        super().__init__("price is invalid or above your USDC limit")
+        self.price_atomic, self.limit_atomic = price_atomic, limit_atomic
+
+
 class PendingPayment(dict):
     """Public receipt fields; redeem credentials stay out of repr/JSON/logs."""
     def __init__(self, fields, *, signature, url, base):
@@ -443,7 +454,7 @@ class HodlOdds:
                     or any(c in k + v for c in "\r\n") or k.lower().startswith(("payment-", "x-payment"))
                     or k.lower() in ("host", "content-length", "transfer-encoding")):
                 raise HodlOddsError("access_headers contains an invalid or reserved payment/transport header")
-        headers["User-Agent"] = "hodlodds-python/0.3.1"
+        headers["User-Agent"] = "hodlodds-python/0.3.2"
         try:
             self.http = _new_http(timeout, headers)
         except Exception:
@@ -621,7 +632,7 @@ class HodlOdds:
         if not self._address_check(row.get("payTo")) or not self._same_address(row.get("payTo"), self.pay_to):
             raise HodlOddsError("server payTo differs from the pinned pay_to address")
         amount = row.get("amount")
-        if not (isinstance(amount, str) and re.fullmatch(r"[1-9][0-9]{0,6}", amount) and int(amount) <= limit):
+        if not (isinstance(amount, str) and re.fullmatch(r"[1-9][0-9]{0,6}", amount)):
             raise HodlOddsError("price is invalid or above your USDC limit")
         extra = row.get("extra")
         if not isinstance(extra, dict) or extra.get("paymentFlow") != "authorization":
@@ -662,6 +673,10 @@ class HodlOdds:
                 board, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()[:32]
             if self.net["family"] == "svm" and extra.get("memo") != expected_memo:
                 raise HodlOddsError("board payment memo does not bind the requested query and count")
+        # Compare with the limit last, so the reported price belongs to an
+        # otherwise valid offer (for boards: priced_n x the per-coin price).
+        if int(amount) > limit:
+            raise PriceLimitError(int(amount), limit)
         return int(amount)
 
     def redeem(self, payment):
@@ -1058,7 +1073,7 @@ def main(argv=None):
     p.add_argument("--min-trades", dest="min_trades_5", type=int)
     p.add_argument("--min-confidence", choices=("high", "medium", "low"))
     p.add_argument("--include-crashed", action=argparse.BooleanOptionalAction, default=None,
-                   help="include already-crashed board rows; --no-include-crashed filters them")
+                   help="include board rows that crashed in the last hour or 24 hours; --no-include-crashed filters them")
     p.add_argument("--board", action="store_true", help="watch a board instead of a mint")
     p.add_argument("--every", type=int, default=5, help="watch interval in minutes, 1..60")
     p.add_argument("--max-spend", help="required watch spending cap in USDC")
