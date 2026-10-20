@@ -53,6 +53,14 @@ pip install "git+https://github.com/hodlodds/hodlodds-sdk"  # or the latest main
 
 Python 3.10+. Dependencies: `httpx` and the official `x402[svm,evm]==2.25.0` SDK (pinned).
 
+## MCP server
+
+The separate [hodlodds-mcp package](mcp/) provides local stdio tools for market
+discovery and crash odds, with per-call and session payment limits.
+
+`pip install hodlodds-mcp` (after the first mcp-v0.1.0 release).
+See [the MCP README](mcp/README.md) for client configuration and payment safety.
+
 ## Use
 
 Command line:

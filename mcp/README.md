@@ -1,0 +1,190 @@
+# hodlodds-mcp
+
+A local stdio MCP server for HodlOdds crash odds. Free tools explain token
+coverage, data markets and feed status. With a local wallet configured, paid
+tools use x402 USDC on Solana or Base with per-call and per-session spending
+limits. Paying on Base does not change the data universe: current paid scores
+cover active SOL-quoted pump.fun graduates.
+
+## Install
+
+```sh
+pip install hodlodds-mcp
+hodlodds-mcp
+# Or run in an isolated environment:
+uvx hodlodds-mcp
+```
+
+Python 3.11+ is required. Dependencies are `hodlodds>=0.3.0,<0.4` and
+`mcp>=2.3,<3`. The HodlOdds client supplies its pinned x402 dependencies. This
+package starts a local process, not an HTTP MCP endpoint. Stdout is reserved
+for MCP protocol messages.
+
+## Tools and prices
+
+| Tool | Cost in USDC | Result |
+| --- | --- | --- |
+| `status()` | Free | Feed state, age, source timestamp and API status fields |
+| `markets()` | Free | Available and experimental data markets, prices and filter syntax |
+| `coverage(mint)` | Free | Observed coverage stage, reason and source timestamp |
+| `meaning()` | Free, offline | Crash definition, confidence interpretation and freshness rules |
+| `crash_odds(mint)` | 0.01 per delivered answer | Crash probability, summary, confidence, forecast timestamps, receipt and budget |
+| `board(...)` | 0.005 per delivered coin; empty results free | Ranked rows or a watchlist, omitted-mint facts, timestamps, receipt and budget |
+
+The separate HTTP API's `/v1/risk/{mint}/last` costs 0.002 USDC for last-known
+odds at most 30 minutes old. **Version 0.1.0 exposes no last-known MCP tool**;
+use the Python SDK's `last()` method directly if you explicitly want that route.
+
+`board` accepts `limit`, `sort`, `max_risk`, `min_risk`, `min_liquidity_sol`,
+`min_age_min`, `max_age_min`, `min_trades_5`, `min_confidence`, `mints`, `chain`
+and `platform`. Sorts are `lowest_risk` (default), `riskiest`, `liquidity`,
+`newest` and `active`. Without `mints`, limits are 10–500 (default 50).
+With a watchlist of 1–100 distinct Solana mint addresses, the default limit is
+its length and explicit limits are 1–100. Only returned coins are charged.
+`not_delivered` contains coverage/filter facts for omitted mints, not inferred
+odds. Probability filters use 0–1; confidence is `high`, `medium` or `low`.
+
+`crash_odds`, `board` and `coverage` accept optional `chain` and `platform`
+strings, comma-separated strings or lists. Currently use `chain="solana"`
+or its CAIP-2 ID and `platform="pumpfun"`; `pump` and `pump.fun` are aliases.
+Values are case-insensitive; empty, duplicate and unsupported values are
+refused before payment. Use `markets()` to check current availability. Data
+markets and payment networks are separate choices.
+
+Every result includes “Odds, not guarantees. Not financial advice.” Errors
+have MCP `isError: true` and a structured error code. Missing confidence is
+reported as `missing`. Receipts contain public payment details, not signed
+authorizations or key contents. Spending is tracked in integer atomic USDC;
+displayed USDC amounts are exact decimal strings.
+
+## Configuration
+
+Tool arguments cannot change the wallet, recipient, payment network, endpoint
+or spending limits. Set these in the MCP process environment:
+
+| Variable | Default / requirement |
+| --- | --- |
+| `HODLODDS_BASE_URL` | `https://api.hodlodds.com`; HTTPS, or HTTP on loopback for local tests |
+| `HODLODDS_NETWORK` | `devnet`; one of `solana`, `base`, `devnet`, `base-sepolia` |
+| `HODLODDS_PAY_TO` | No default. Pin the recipient for the chosen payment network from `/v1/meta`, after independently verifying it. Required on mainnet even in read-only mode, and whenever a key is configured. |
+| `HODLODDS_KEYPAIR` | Optional local key-file path. Omit or leave empty for read-only mode. Use an absolute path in desktop configurations. |
+| `HODLODDS_MAX_PRICE_USDC` | `0.01` per call, maximum `2.5`; single-token calls retain the SDK's `1` USDC ceiling. Positive plain decimal with at most six fractional digits. |
+| `HODLODDS_SESSION_BUDGET_USDC` | Required when a key is set; positive plain decimal with at most six fractional digits. No default budget. Resets on process restart. |
+
+The default per-call cap can buy at most two delivered board rows. A larger
+offer is refused before key access; the cap does not trim an answer down to
+two coins. Set `0.50` explicitly for up to 100 delivered rows, for example.
+The accepted offer amount, not the requested limit, determines the budget debit.
+
+**Read-only mode:** omit the key and session budget. The registered tools are
+`status`, `markets`, `coverage` and `meaning`. No key is loaded at startup in
+either mode. Key files must be regular, non-symlink files, mode `0600`, at most
+4 KiB. Solana uses solana-keygen JSON; Base uses a local hex/JSON private-key
+file. Use a dedicated low-balance wallet. Never put key contents in a client
+configuration.
+
+## Client configuration
+
+Claude Desktop: merge this read-only setup into `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "hodlodds": {
+      "command": "uvx",
+      "args": ["hodlodds-mcp"]
+    }
+  }
+}
+```
+
+Use the executable's absolute path if the desktop app cannot find `uvx`.
+To enable payments, add the environment values below to that server entry.
+This is also a generic stdio process configuration for clients that accept
+`command`, `args` and `env` (adapt the surrounding configuration to your client):
+
+```json
+{
+  "command": "hodlodds-mcp",
+  "args": [],
+  "env": {
+    "HODLODDS_BASE_URL": "https://api.hodlodds.com",
+    "HODLODDS_NETWORK": "solana",
+    "HODLODDS_PAY_TO": "REPLACE_WITH_VERIFIED_RECIPIENT_FROM_META",
+    "HODLODDS_KEYPAIR": "/absolute/path/to/payer.json",
+    "HODLODDS_MAX_PRICE_USDC": "0.01",
+    "HODLODDS_SESSION_BUDGET_USDC": "0.10"
+  }
+}
+```
+
+Replace the recipient and file-path placeholders before starting. The example
+uses real mainnet USDC. For Base payments, choose `base`, its recipient and an
+EVM key file. Test networks require a test API that offers that network:
+use `devnet` or `base-sepolia`, test USDC and the matching verified recipient.
+These snippets are configuration templates; assistant applications were not
+launched during offline package testing.
+
+Restart the MCP process after changing its environment. Reconcile any uncertain
+payment first: a restart also resets the session budget.
+
+## Payment safety and reconciliation
+
+Paid calls are serialized across tools. The SDK validates the offer's network,
+asset, pinned recipient, query binding and amount before key access or signing.
+The session budget checks that exact accepted amount, then reserves it before
+the authorized request. A successful receipt retains the debit. Exhausting the
+budget refuses the next payment before signing; free tools remain available.
+
+A refusal marked `HodlOdds-Charged: no` is free only when the receipt does not
+indicate success or a transaction. A conflicting or malformed receipt remains
+uncertain. Confirmed free refusals refund the reservation, return an error and
+leave payments enabled.
+
+After an uncertain payment—such as a lost response, missing receipt or
+conflicting receipt—**all further paid calls pause**. The reserved amount stays
+spent until the operator reconciles it against finalized wallet history and
+payment records. The result includes public reconciliation details. There is
+no tool to clear the pause, no automatic retry or redemption, and no pending
+authorization file is written. Restart only after reconciliation and choose a
+new budget that accounts for prior spending.
+
+The budget is local to one process and is not shared or persistent. **Every
+restart resets it.** The paid request timeout is 90 seconds. Cancellation does
+not abandon in-flight payment accounting. A settled answer with an unexpected
+shape returns raw data with a warning instead of authorizing another payment.
+Receipts report server settlement; they are not independent proof of finality.
+
+## Meaning and freshness
+
+0.04 means about 4 in 100 tokens like this one lose 90% or more of their price within the next 60 minutes. Higher means riskier, but a low number does not mean safe: smaller or slower drops are not counted, and the odds change minute by minute.
+
+Scores are recomputed every 60 seconds, about 20 seconds after each minute closes, from completed one-minute bars up to `as_of`. Each score covers the 60 minutes after its `as_of` time and is valid only until the next update; the odds for the same token can rise sharply from one minute to the next. Scoring starts around :20; computation and publication can delay availability. For decisions, refresh immediately before acting and once per minute for continuous monitoring, checking `as_of` for a new minute. The API freshness cutoff is separate: by default, data becomes `stale` more than 120 seconds after `issued_at` or after `expires_at`. A new request does not restart the forecast window.
+
+A crash is a completed one-minute close in SOL at least 90% below the reference
+price within the displayed 60-minute window. `as_of` and `horizon_end` are UTC
+Unix seconds. Confidence describes historical calibration and evidence; it is
+not a token-specific interval or guarantee. Missing odds, missing confidence,
+stale data and uncovered tokens are not safety signals. Very low odds say
+“under 0.1%”, never a rounded zero.
+
+Odds, not guarantees. Not financial advice.
+
+## Development
+
+From the public repository root, with the dependencies and pytest installed:
+
+```sh
+python -m pytest -q mcp/tests
+python -m build mcp
+```
+
+Tests use the installed public HodlOdds package, mocked HTTP and signing, and
+an in-memory MCP session. Socket connections and DNS lookups are disabled.
+They do not prove live settlement or desktop-client integration. The budget
+adapter uses the SDK's watch accounting hook, so the dependency is bounded to
+`hodlodds>=0.3.0,<0.4` and tested before upgrades.
+
+`server.json` contains registry metadata for `com.hodlodds/hodlodds-mcp`.
+Publishing to PyPI and publishing a registry listing are separate steps;
+namespace ownership and registry acceptance must be verified by the publisher.

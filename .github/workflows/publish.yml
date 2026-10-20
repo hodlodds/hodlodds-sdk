@@ -1,6 +1,7 @@
 name: Publish to PyPI
 on:
   push:
+    # v* does not match mcp-v*; publish-mcp.yml releases the MCP package separately.
     tags: ["v*"]
 permissions:
   contents: read

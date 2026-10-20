@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hodlodds-mcp"
+version = "0.1.0"
+description = "Local stdio MCP tools for HodlOdds crash odds with bounded USDC payments"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = ["hodlodds>=0.3.0,<0.4", "mcp>=2.3,<3"]
+
+[project.scripts]
+hodlodds-mcp = "hodlodds_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

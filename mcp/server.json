@@ -1,0 +1,44 @@
+{
+  "name": "com.hodlodds/hodlodds-mcp",
+  "description": "Local crash-odds tools with free market discovery and bounded x402 USDC payments on Solana or Base.",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "hodlodds-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "HODLODDS_BASE_URL",
+          "description": "HodlOdds HTTPS API or loopback test API",
+          "default": "https://api.hodlodds.com"
+        },
+        {
+          "name": "HODLODDS_NETWORK",
+          "description": "solana, base, devnet or base-sepolia",
+          "default": "devnet"
+        },
+        {
+          "name": "HODLODDS_PAY_TO",
+          "description": "Verified recipient; required on mainnet and for keyed test-network use"
+        },
+        {
+          "name": "HODLODDS_KEYPAIR",
+          "description": "Optional absolute local key-file path; omission enables read-only mode"
+        },
+        {
+          "name": "HODLODDS_MAX_PRICE_USDC",
+          "description": "Per-call USDC cap",
+          "default": "0.01"
+        },
+        {
+          "name": "HODLODDS_SESSION_BUDGET_USDC",
+          "description": "Process USDC budget; required when a key is set; resets on restart"
+        }
+      ]
+    }
+  ]
+}
