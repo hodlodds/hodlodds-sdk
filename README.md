@@ -346,15 +346,20 @@ The paid request waits up to 90 seconds (`paid_timeout`, 30–600). If the
 connection ends after authorization, keep the pending record and use explicit
 recovery instead of paying again:
 
-- An eligible settled payment whose answer was not delivered can be redeemed
+- A settled payment that the server recorded as undelivered can be redeemed
   **once** within 24 hours; a redeem still checks the route and answer eligibility.
+  The server records an answer as undelivered when your connection was already
+  closed when the answer was ready, or when the settlement was only confirmed
+  later. An answer the server completed and sent is recorded as delivered, and
+  its redeem is refused with `409`, even if it was lost on the way to you.
 - In Python, the error carries it: `client.redeem(error.payment)` re-sends the same
   authorization with `HodlOdds-Redeem: 1`. It never signs a new payment and never
   settles a second time.
 - The CLI saves it to `~/.config/hodlodds/pending/<id>.json` (mode 0600) and prints
   the path; run `hodlodds redeem <file>` after about two minutes.
 - A `409` may mean confirmation is still pending, no redeemable payment was
-  found, or it has already been redeemed or expired. Follow `Retry-After` when
+  found, the answer was already delivered, or it has already been redeemed or
+  expired. Follow `Retry-After` when
   supplied and keep the pending record on refusal. A refused redeem signs and
   settles nothing new; it does not by itself prove the original payment failed.
 
