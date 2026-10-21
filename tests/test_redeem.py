@@ -80,6 +80,24 @@ class RedeemTests(unittest.TestCase):
         linkdir=self.directory.parent/'alias'; linkdir.symlink_to(self.directory,target_is_directory=True)
         with self.assertRaises(client.HodlOddsError): client.save_pending(error.payment,linkdir)
 
+    def test_refused_redeem_keeps_the_server_reason_and_retry_after(self):
+        # 0.3.3 (Fable audit 21): "being verified" and "never settled" call for different actions
+        c,error=self.uncertain()
+        self.http.responses.append(f.Response(409,{'Retry-After':'30'},{'error':'payment is being verified on-chain'}))
+        with self.assertRaises(client.HodlOddsError) as caught:
+            c.redeem(error.payment)
+        self.assertEqual(caught.exception.body,{'error':'payment is being verified on-chain'})
+        self.assertEqual(caught.exception.retry_after,30)
+        self.assertEqual(caught.exception.status,409)
+        path=client.save_pending(error.payment,self.directory)
+        self.http.responses.append(f.Response(409,{},{'error':'this payment never settled; request a new offer'}))
+        output=io.StringIO()
+        with patch.object(client,'HodlOdds',return_value=c), contextlib.redirect_stderr(output):
+            self.assertEqual(client.main(['redeem',str(path)]),1)
+        self.assertIn('this payment never settled; request a new offer',output.getvalue())
+        self.assertNotIn(self.sdk.encoded,output.getvalue())
+        self.assertEqual(self.sdk.signs,1)
+
     def test_cli_saves_and_prints_only_path_then_redeems(self):
         c,error=self.uncertain()
         c.risk=lambda *args,**kwargs: (_ for _ in ()).throw(error)

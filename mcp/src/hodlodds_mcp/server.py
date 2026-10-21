@@ -12,7 +12,7 @@ from threading import Lock
 from typing import Any, Literal
 
 import anyio
-from hodlodds import HodlOdds, HodlOddsError, PriceLimitError
+from hodlodds import HodlOdds, HodlOddsError, PendingPayment, PriceLimitError, save_pending
 from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, TextContent
 
@@ -38,6 +38,12 @@ RECONCILE = (
     "Payments paused. Check finalized wallet history and the operator's payment records using these "
     "reconciliation details. Restart only after checking the wallet and reconciling this payment. "
     "A restart starts a new process budget."
+)
+# 0.2.3 (Fable audit 21): the signed authorization is kept so an undelivered paid answer can be redeemed once.
+REDEEM_HINT = (
+    " The signed authorization was saved to pending_file (mode 0600). After about two minutes, "
+    "`hodlodds redeem <pending_file>` (Python SDK CLI, same network) returns an answer the server recorded as "
+    "undelivered once, without a new payment; a refusal says why and signs nothing."
 )
 
 # Fixed JSON `error` texts the HodlOdds API can return to a client. Kept equal to
@@ -301,6 +307,10 @@ def error_details(exc):
     body = exc.body if isinstance(exc.body, dict) else {}
     if body.get("code") == "offer_changed":
         result["server_code"] = "offer_changed"
+    age = body.get("last_known_age_s")
+    if type(age) is int and age >= 0:
+        # 0.2.3: a labelled last-known answer exists for this stale refusal (opt-in /last route)
+        result.update(last_known_available=True, last_known_age_s=age)
     message = body.get("error")
     if isinstance(message, str):
         if message in SERVER_ERRORS:
@@ -398,6 +408,12 @@ class Service:
         try:
             return result(**operation())
         except Exception as exc:
+            # 0.2.3 (Fable audit 21): a local argument refusal is not a service failure
+            refusal = client_refusal(exc, board=False, max_atomic=self.config.max_atomic)
+            if refusal is not None:
+                return result(error="client_refused", message=refusal,
+                              detail="Refused locally before any request was sent; nothing was signed.",
+                              http_status=None)
             return result(error="free_request_failed", message="Free request failed; nothing signed.",
                           **error_details(exc))
 
@@ -441,8 +457,15 @@ class Service:
                                   payment=None, **self.ledger.fields())
                 if payment is not None and payment.get("charged") is not False:
                     self.ledger.paused = receipt(payment)
-                    return result(error="payments_paused", message=RECONCILE,
-                                  payment=self.ledger.paused, **error_details(exc), **self.ledger.fields())
+                    pending_file = None
+                    if isinstance(payment, PendingPayment):
+                        try:
+                            pending_file = str(save_pending(payment))
+                        except HodlOddsError:
+                            pending_file = None  # reconciliation details still identify the payment
+                    return result(error="payments_paused", message=RECONCILE + (REDEEM_HINT if pending_file else ""),
+                                  payment=self.ledger.paused, pending_file=pending_file,
+                                  **error_details(exc), **self.ledger.fields())
                 refusal = client_refusal(exc, board=board, max_atomic=self.config.max_atomic) if answer is None else None
                 if refusal is not None:
                     return result(error="client_refused", message=refusal,

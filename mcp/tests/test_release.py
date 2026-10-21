@@ -15,7 +15,7 @@ REPO = PACKAGE.parent
 def test_package_dependency_bounds_and_entry_point():
     project = tomllib.loads((PACKAGE / "pyproject.toml").read_text())["project"]
     assert project["name"] == "hodlodds-mcp"
-    assert project["version"] == __version__ == "0.2.2"
+    assert project["version"] == __version__ == "0.2.3"
     assert project["requires-python"] == ">=3.11"
     assert project["dependencies"] == ["hodlodds>=0.3.2,<0.4", "mcp>=2.3,<3"]
     assert project["scripts"] == {"hodlodds-mcp": "hodlodds_mcp.server:main"}
@@ -27,7 +27,7 @@ def test_package_dependency_bounds_and_entry_point():
     }
     sdk = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]
     assert project["classifiers"] == sdk["classifiers"]
-    assert sdk["version"] == hodlodds.__version__ == "0.3.2"
+    assert sdk["version"] == hodlodds.__version__ == "0.3.3"
     assert "certifi>=2026.10.19" in sdk["dependencies"]
     assert sdk["authors"] == [{"name": "HodlOdds"}]
     assert sdk["requires-python"] == ">=3.10"
@@ -60,8 +60,8 @@ def test_release_workflows_keep_sdk_and_mcp_artifacts_separate():
     sdk_workflow = (REPO / ".github/workflows/publish.yml").read_text()
     assert 'tags: ["mcp-v*"]' in workflow
     assert 'tags: ["v*"]' in sdk_workflow
-    assert fnmatch.fnmatchcase("mcp-v0.2.2", "mcp-v*")
-    assert not fnmatch.fnmatchcase("mcp-v0.2.2", "v*")
+    assert fnmatch.fnmatchcase("mcp-v0.2.3", "mcp-v*")
+    assert not fnmatch.fnmatchcase("mcp-v0.2.3", "v*")
     assert "environment: pypi-mcp" in workflow
     assert "id-token: write" in workflow
     assert "python -m build mcp" in workflow

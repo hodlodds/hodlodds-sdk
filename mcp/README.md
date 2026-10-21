@@ -190,10 +190,13 @@ and repeated price and budget checks.
 After an uncertain payment—such as a lost response, missing receipt or
 conflicting receipt—**all further paid calls pause**. The reserved amount stays
 spent until the operator reconciles it against finalized wallet history and
-payment records. The result includes public reconciliation details. There is
-no tool to clear the pause, no automatic retry or redemption, and no pending
-authorization file is written. Restart only after reconciliation and choose a
-new budget that accounts for prior spending.
+payment records. The result includes public reconciliation details and, from
+0.2.3, `pending_file`: the signed authorization saved privately (mode 0600,
+`~/.config/hodlodds/pending/`). After about two minutes, `hodlodds redeem
+<pending_file>` (the Python SDK CLI, same network) returns an answer the server
+recorded as undelivered, once and without a new payment. There is no tool to
+clear the pause and no automatic retry or redemption. Restart only after
+reconciliation and choose a new budget that accounts for prior spending.
 
 The budget is local to one process and is not shared or persistent. **Every
 restart resets it.** The paid request timeout is 90 seconds. Cancellation does
@@ -220,13 +223,16 @@ is true; an older collapse reads false. `crashed_within_24h` and
 `last_crash_as_of` say whether an API snapshot saw that threshold within the
 last 24 hours and when (UTC Unix seconds). The memory only knows snapshots the
 API received: a crash that happened entirely during an API outage is not seen.
-Both fields are null while the memory is unavailable. Either flag
+Both fields are null while the memory is unavailable, including for up to 24
+hours after a gap of more than an hour in accepted snapshots, a restore or a
+fresh start. Either flag
 adds a `note`, and `summary` carries the same context: the odds then describe a
 further 90% drop from the current price, not a recovery or safety signal.
 Unknown drawdown gives a null flag. These are past-price facts, not new model
 predictions. Below about 2%, historical crash rates have run up to
 about twice the predicted value, under one percentage point in absolute
-terms; those answers carry low confidence.
+terms. Answers from 0.5% to 2% carry low confidence; answers below 0.5% carry
+at most medium, marked historically under-predicted.
 
 Odds, not guarantees. Not financial advice.
 

@@ -30,12 +30,14 @@ is unknown); an older collapse reads `false`. `crashed_within_24h` and
 token within the last 24 hours, and the latest such snapshot time (UTC epoch
 seconds). The memory only knows snapshots the API received: a crash that
 happened entirely during an API outage is not seen. Both fields are `null`
-while the memory is unavailable. Either crash flag adds a `note`
+while the memory is unavailable, including for up to 24 hours after a gap of
+more than an hour in accepted snapshots, a restore or a fresh start. Either crash flag adds a `note`
 and crash context in `summary`: a low crash probability after a collapse is not
 a recovery or safety signal.
 Below about 2%, observed crash rates have run up to about twice the predicted
-value, under one percentage point in absolute terms; those answers carry
-`confidence: low`.
+value, under one percentage point in absolute terms. Answers from 0.5% to 2%
+carry `confidence: low`; answers below 0.5% carry at most `medium`, with
+`direction: historically under-predicted`.
 
 | Route | Price | Notes |
 |---|---|---|

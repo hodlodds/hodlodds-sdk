@@ -191,9 +191,21 @@ class WatchTests(OfflineWatch, unittest.TestCase):
                 self.assertEqual(len(self.http.calls), 3)
                 self.assertEqual(self.sdk.signs, 1)
 
+    def test_unsigned_free_503_is_a_skipped_cycle_not_a_stop(self):
+        # 0.3.3 (Fable audit 21): the feed can turn stale between the status check and the request (R99 pauses)
+        c = self.make([status(), f.Response(503, body={"error": "Feed interrupted"})])
+        watch = c.watch(f.MINT, max_spend_usdc="1", max_calls=1)
+        first = next(watch)
+        self.assertEqual(first.status, 503)
+        self.assertEqual(self.sdk.signs, 0)
+        self.assertIsNone(watch.stop_reason)
+        stopping = self.make([status(), f.Response(503)]).watch(f.MINT, max_spend_usdc="1", stop_on_stale=True)
+        next(stopping)
+        self.assertEqual(list(stopping), [])
+        self.assertEqual(stopping.stop_reason, "feed stale (free 503 before payment)")
+
     def test_free_status_or_route_error_stops_without_payment(self):
-        for responses in ([f.Response(503)], [status(), f.Response(503)],
-                          [status(), f.Response(404)]):
+        for responses in ([f.Response(503)], [status(), f.Response(404)]):
             c = self.make(responses)
             watch = c.watch(f.MINT, max_spend_usdc="1")
             with self.assertRaises(client.HodlOddsError) as caught:

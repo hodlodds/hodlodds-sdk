@@ -53,6 +53,7 @@ class HodlOddsError(Exception):
     def __init__(self, message, status=None, body=None, payment=None):
         super().__init__(message)
         self.status, self.body, self.payment = status, body, payment
+        self.retry_after = None  # seconds, when a refused redeem carried Retry-After (0.3.3)
 
 
 class PriceLimitError(HodlOddsError):
@@ -457,7 +458,7 @@ class HodlOdds:
                     or any(c in k + v for c in "\r\n") or k.lower().startswith(("payment-", "x-payment"))
                     or k.lower() in ("host", "content-length", "transfer-encoding")):
                 raise HodlOddsError("access_headers contains an invalid or reserved payment/transport header")
-        headers["User-Agent"] = "hodlodds-python/0.3.2"
+        headers["User-Agent"] = "hodlodds-python/0.3.3"
         try:
             self.http = _new_http(timeout, headers)
         except Exception:
@@ -696,11 +697,16 @@ class HodlOdds:
                 or not (parsed.path == urlparse(self.base).path + '/v1/board'
                     or parsed.path.startswith(urlparse(self.base).path + '/v1/risk/'))):
             raise HodlOddsError("invalid redeem route")
-        response = None
+        response, body, retry_after = None, None, None
         try:
             response = self._request(payment._url, headers={'PAYMENT-SIGNATURE': payment._signature, 'HodlOdds-Redeem': '1'})
             tx = response.headers.get('hodlodds-redeemed')
             if response.status_code != 200 or not tx:
+                # 0.3.3 (Fable audit 21): the server's reason (verifying / never settled / delivered / redeemed) and
+                # Retry-After decide whether to wait or buy again; keep them on the error
+                body = _body(response)
+                value = (response.headers.get('retry-after') or '').strip()
+                retry_after = int(value) if value.isdigit() and int(value) <= 86400 else None
                 raise HodlOddsError("redeem returned HTTP %d; no new payment was signed; keep the pending payment" % response.status_code)
             if not (_base58_size(tx) == 64 if self.net['family'] == 'svm' else
                     bool(re.fullmatch('0x[0-9a-fA-F]{64}', tx))):
@@ -710,7 +716,9 @@ class HodlOdds:
             return Answer(200, _json_object(response), receipt)
         except Exception as exc:
             reason = str(exc) if isinstance(exc, HodlOddsError) else 'redeem response unavailable; not retried'
-            raise HodlOddsError(reason, response.status_code if response else None, payment=payment) from None
+            error = HodlOddsError(reason, response.status_code if response else None, body, payment=payment)
+            error.retry_after = retry_after
+            raise error from None
 
     def _paid(self, path, max_price_usdc, board_query=None, *, _watch=None):
         maximum = BOARD_MAX_USDC if board_query is not None else HARD_MAX_USDC
@@ -967,6 +975,15 @@ class Watch:
                     yield self._result(Answer(None, status), self.stop_reason)
                     return
                 except HodlOddsError as exc:
+                    if exc.payment is None and exc.status == 503:
+                        # 0.3.3 (Fable audit 21): the feed turned stale between the status check and the request; this
+                        # free 503 came before any signing, so the cycle is skipped like a stale status
+                        reason = "feed stale (free 503 before payment)"
+                        yield self._result(Answer(exc.status, exc.body if isinstance(exc.body, dict) else {}), reason)
+                        if self.stop_on_stale:
+                            self.stop_reason = reason
+                            return
+                        continue
                     if not exc.payment or exc.payment.get('charged') is not False:
                         raise
                     self.calls += 1
@@ -1179,8 +1196,10 @@ def main(argv=None):
                 print("Pending payment saved: " + str(save_pending(e.payment)), file=sys.stderr)
             except HodlOddsError as save_error:
                 print(str(save_error), file=sys.stderr)
-        if e.body is not None and e.payment is None:
+        if e.body is not None and (e.payment is None or a.command == 'redeem'):
             print(json.dumps(e.body, indent=2), file=sys.stderr)
+        if a.command == 'redeem' and e.retry_after is not None:
+            print("Retry after %d seconds with the same pending file." % e.retry_after, file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

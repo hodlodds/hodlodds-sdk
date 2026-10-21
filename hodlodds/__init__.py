@@ -4,4 +4,4 @@ from .client import (NETWORKS, Answer, HodlOdds, HodlOddsError, PendingPayment, 
 
 __all__ = ["HodlOdds", "HodlOddsError", "PriceLimitError", "Answer", "NETWORKS", "PendingPayment", "save_pending",
            "load_pending", "Watch"]
-__version__ = "0.3.2"
+__version__ = "0.3.3"

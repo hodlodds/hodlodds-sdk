@@ -154,3 +154,14 @@ def test_current_server_refusals_are_recognized():
 def test_templates_show_only_the_fixed_prefix(message, shown):
     exc = sdk.HodlOddsError("free answer HTTP 400 (nothing paid)", status=400, body={"error": message})
     assert error_details(exc) == {"http_status": 400, "server_error": shown}
+
+
+def test_stale_refusal_says_a_last_known_answer_exists():
+    # 0.2.3 (Fable audit 21): the server's age of the labelled last-known answer, never its hint text
+    from hodlodds import HodlOddsError
+    from hodlodds_mcp.server import error_details
+    details = error_details(HodlOddsError("x", 503, {"error": "Feed interrupted", "last_known_age_s": 120,
+                                                     "hint": "/v1/risk/ANY/last"}))
+    assert details["last_known_available"] is True and details["last_known_age_s"] == 120
+    assert "hint" not in details
+    assert "last_known_available" not in error_details(HodlOddsError("x", 503, {"error": "Feed interrupted"}))

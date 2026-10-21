@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import stat
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -61,6 +62,10 @@ def api(monkeypatch, tmp_path):
     monkeypatch.setenv("HODLODDS_PAY_TO", PAYTO)
     monkeypatch.setenv("HODLODDS_KEYPAIR", str(key))
     monkeypatch.setenv("HODLODDS_SESSION_BUDGET_USDC", "0.02")
+    # 0.2.3: a paused payment writes its pending file under HOME; never the developer's real home
+    state.home = tmp_path / "home"
+    state.home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(state.home))
 
     def handler(request):
         state.requests.append(request)
@@ -239,6 +244,11 @@ async def test_ambiguous_pauses_only_paid_calls(api, behavior, capsys):
     assert str(api.key) not in json.dumps(data)
     captured = capsys.readouterr()
     assert SECRET not in captured.out + captured.err and SIGNED not in captured.out + captured.err
+    # 0.2.3 (Fable audit 21): the redeem credential is kept in a private file, never in the result
+    pending = Path(data["pending_file"])
+    assert pending.parent == api.home / ".config" / "hodlodds" / "pending"
+    assert stat.S_IMODE(pending.stat().st_mode) == 0o600 and SIGNED not in json.dumps(data)
+    assert "hodlodds redeem <pending_file>" in data["message"]
 
 
 @pytest.mark.anyio
@@ -302,6 +312,15 @@ async def test_free_empty_and_refusal(api):
         api.behavior = "free"
         assert (await call(client, "crash_odds", mint=MINT))["error"] == "paid_request_failed"
     assert api.signs == api.loads == 0
+
+
+@pytest.mark.anyio
+async def test_free_tool_reports_a_local_refusal_as_such(api):
+    # 0.2.3 (Fable audit 21): an invalid mint is refused locally, not a "free request failed" outage
+    async with session(create_server()) as client:
+        data = await call(client, "coverage", mint="not-a-mint")
+        assert data["error"] == "client_refused" and data["http_status"] is None
+    assert api.requests == []
 
 
 @pytest.mark.anyio
