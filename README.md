@@ -30,8 +30,11 @@ is unknown); an older collapse reads `false`. `crashed_within_24h` and
 token within the last 24 hours, and the latest such snapshot time (UTC epoch
 seconds). The memory only knows snapshots the API received: a crash that
 happened entirely during an API outage is not seen. Both fields are `null`
-while the memory is unavailable, including for up to 24 hours after a gap of
-more than an hour in accepted snapshots, a restore or a fresh start. Either crash flag adds a `note`
+while the memory cannot vouch for the whole 24 hours: for 23 hours after it
+missed more than an hour of the snapshots the API accepted (a gap, or a
+replaced or restored memory file), while it is over its size limit (until the
+tokens it dropped would have expired), and while its store is failing. A new
+deployment starts with the memory available. Either crash flag adds a `note`
 and crash context in `summary`: a low crash probability after a collapse is not
 a recovery or safety signal.
 Below about 2%, observed crash rates have run up to about twice the predicted
