@@ -23,7 +23,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertEqual(dependencies(), ["certifi>=2026.10.19", "httpx>=0.27,<1", "x402[svm,evm]==2.25.0"])
         text = (ROOT / "pyproject.toml").read_text()
         self.assertIn('authors = [{ name = "HodlOdds" }]', text)
-        self.assertIn('version = "0.3.3"', text)
+        self.assertIn('version = "0.3.4"', text)
         self.assertIs(client.PriceLimitError, __import__("hodlodds").PriceLimitError)
 
     def test_readme_documents_new_fields_defaults_and_security(self):

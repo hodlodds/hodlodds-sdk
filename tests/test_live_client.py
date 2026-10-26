@@ -95,7 +95,7 @@ class ServiceCompatibilityTests(OfflineNetworks, unittest.TestCase):
     make = f.ClientTests.make
 
     def test_release_version_and_user_agent_agree(self):
-        self.assertEqual(__version__, '0.3.3')
+        self.assertEqual(__version__, '0.3.4')
         project = (Path(__file__).resolve().parents[1] / 'pyproject.toml').read_text()
         self.assertEqual(re.search(r'^version = "([^"]+)"$', project, re.MULTILINE).group(1), __version__)
         with patch.object(client, '_new_http', return_value=f.FakeHTTP([])) as factory:

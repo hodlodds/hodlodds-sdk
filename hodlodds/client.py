@@ -458,7 +458,7 @@ class HodlOdds:
                     or any(c in k + v for c in "\r\n") or k.lower().startswith(("payment-", "x-payment"))
                     or k.lower() in ("host", "content-length", "transfer-encoding")):
                 raise HodlOddsError("access_headers contains an invalid or reserved payment/transport header")
-        headers["User-Agent"] = "hodlodds-python/0.3.3"
+        headers["User-Agent"] = "hodlodds-python/0.3.4"
         try:
             self.http = _new_http(timeout, headers)
         except Exception:

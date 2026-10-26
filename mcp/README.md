@@ -224,12 +224,13 @@ is true; an older collapse reads false. `crashed_within_24h` and
 last 24 hours and when (UTC Unix seconds). The memory only knows snapshots the
 API received: a crash that happened entirely during an API outage is not seen.
 Both fields are null while the memory cannot vouch for the whole 24 hours: for
-23 hours after it missed more than an hour of the snapshots the API accepted (a
-gap, or a replaced or restored memory file), while it is over its size limit
-(until the tokens it dropped would have expired), and while its store is
-failing. A new deployment starts with the memory available. Either flag
-adds a `note`, and `summary` carries the same context: the odds then describe a
-further 90% drop from the current price, not a recovery or safety signal.
+23 hours after a snapshot arrives more than an hour after the last one the
+memory recorded (a feed outage, or a replaced or restored memory file), after
+it exceeded its size limit (until the tokens it dropped would have expired),
+and while its store is failing. A new deployment starts with the memory
+available. Either flag adds a `note`, and `summary` carries the same context:
+the odds then describe a further 90% drop from the current price, not a
+recovery or safety signal.
 Unknown drawdown gives a null flag. These are past-price facts, not new model
 predictions. Below about 2%, historical crash rates have run up to
 about twice the predicted value, under one percentage point in absolute

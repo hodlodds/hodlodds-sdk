@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.hodlodds/hodlodds-mcp",
   "description": "Local crash-odds tools with free market discovery and bounded x402 USDC payments on Solana or Base.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "websiteUrl": "https://hodlodds.com",
   "repository": {
     "url": "https://github.com/hodlodds/hodlodds-sdk",
@@ -12,7 +12,7 @@
     {
       "registryType": "pypi",
       "identifier": "hodlodds-mcp",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "transport": {
         "type": "stdio"
       },
