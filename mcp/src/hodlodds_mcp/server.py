@@ -22,7 +22,7 @@ DISCLAIMER = "Odds, not guarantees. Not financial advice."
 # Verbatim meaning and freshness from cloud/static/llms.txt, bundled for offline use.
 MEANING = (
     "0.04 means about 4 in 100 tokens like this one lose 90% or more of their price within the next 60 minutes. "
-    "Higher means riskier, but a low number does not mean safe: smaller or slower drops are not counted, "
+    "Higher means riskier. A low number is not a safety signal: smaller or slower drops are not counted, "
     "and the odds change minute by minute."
 )
 FRESHNESS = (

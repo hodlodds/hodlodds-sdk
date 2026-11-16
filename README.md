@@ -1,7 +1,9 @@
 # hodlodds — Python client
 
 Pay-per-answer **crash odds for Solana memecoins**, paid per request with
-[x402](https://www.x402.org) (USDC on Solana or Base). No accounts, no API keys.
+[x402](https://www.x402.org) (USDC on Solana or Base). This client needs no account
+and no API key: it pays each answer itself. (hodlodds.com also offers prepaid
+API keys; this client does not use them.)
 
 The API at `https://api.hodlodds.com` accepts payments. Check its free status,
 markets and coverage endpoints before paying. Local test servers can use
@@ -48,6 +50,7 @@ carry `confidence: low`; answers below 0.5% carry at most `medium`, with
 | `GET /v1/meta` | free | Definition, prices, payment details, model card |
 | `GET /v1/markets` | free | Available data chains, platforms and coverage |
 | `GET /v1/coverage/{mint}` | free | Coverage stage and reason for one token |
+| `GET /v1/board/delayed` | free | The first 25 rows of the board as it was at least ten minutes before the newest minute (`sort` `riskiest`, `newest` or `active`): odds from that minute, not current odds. This client has no method for it |
 | `GET /v1/risk/{mint}` | $0.01 | Fresh odds for one token |
 | `GET /v1/board?limit=N` | $0.005 per coin delivered | Request 10–500 coins, or a watchlist of 1–100 distinct mints; pay only for coins returned, empty is free |
 | `GET /v1/risk/{mint}/last` | $0.002 | Last known odds, at most 30 minutes old (also while live); when stale it is labelled stale and confidence drops one level |
@@ -80,7 +83,7 @@ The separate [hodlodds-mcp package](mcp/) provides local stdio tools for market
 discovery and crash odds, with per-call and session payment limits.
 
 `pip install hodlodds-mcp`
-See [the MCP README](mcp/README.md) for client configuration and payment safety.
+See [the MCP README](mcp/README.md) for client configuration and payment checks.
 
 ## Use
 
@@ -144,11 +147,11 @@ signing; its `price_atomic` and `limit_atomic` give the offered total and your
 limit in USDC atomic units (1 USDC = 1,000,000).
 `min_trades_5` accepts integers from 0 through 9223372036854775807.
 
-Compatibility: the 0.2.0 `safest` sort remains accepted as an alias for
-`lowest_risk`, and the `mainnet` payment-network alias still means `solana`.
-These older spellings are deprecated in examples; existing calls keep working.
+Compatibility: the `mainnet` payment-network alias still means `solana`, and the
+deprecated sort name `safest` still means `lowest_risk`. Examples use the current
+spellings; existing calls keep working.
 
-For `lowest_risk` and its `safest` alias, the server applies
+For `lowest_risk`, the server applies
 `min_trades_5=3`, `min_liquidity_sol=5` and `include_crashed=false` when those
 filters are omitted, so barely traded, illiquid or recently collapsed tokens
 do not dominate the list. The crash filter excludes both `already_crashed` and
@@ -372,7 +375,7 @@ Environment variables for the CLI: `HODLODDS_BASE_URL`, `HODLODDS_NETWORK`,
 `HODLODDS_KEYPAIR`, `HODLODDS_PAY_TO`, `HODLODDS_MAX_PRICE`.
 Exit status: `0` success, `1` refusal/API/transport failure, `2` invalid usage.
 
-## Safety rules built into the client
+## Checks built into the client
 
 - A payment is signed only after the 402 offer passes every check: x402 v2, the
   chosen network, exact USDC, authorization flow, the pinned `payTo`, a valid
@@ -419,8 +422,8 @@ installed, additional tests build real signatures with all RPC calls mocked.
 
 ## Disclaimer
 
-Odds, not guarantees. Not financial advice. Low odds do not mean a token is
-safe; collapses can happen without warning. The operator also runs an
+Odds, not guarantees. Not financial advice. Low odds are not a safety
+signal: collapses can happen without warning. The operator also runs an
 independent trading system that may trade tokens HodlOdds scores; it never
 receives customer requests or purchases, and nobody can pay to change a score.
 

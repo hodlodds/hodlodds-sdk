@@ -44,15 +44,14 @@ per-call cap, session budget and uncertain-payment pause apply to all paid tools
 
 `board` accepts `limit`, `sort`, `max_risk`, `min_risk`, `min_liquidity_sol`,
 `min_age_min`, `max_age_min`, `min_trades_5`, `min_confidence`, `include_crashed`,
-`mints`, `chain` and `platform`. Sorts are `lowest_risk` (default), `safest`
-(an alias for `lowest_risk`), `riskiest`, `liquidity`,
-`newest` and `active`. Without `mints`, limits are 10–500 (default 50).
+`mints`, `chain` and `platform`. Sorts are `lowest_risk` (default), `riskiest`, `liquidity`,
+`newest` and `active`; the deprecated name `safest` still means `lowest_risk`. Without `mints`, limits are 10–500 (default 50).
 With a watchlist of 1–100 distinct Solana mint addresses, the default limit is
 its length and explicit limits are 1–100. Only returned coins are charged.
 `not_delivered` contains coverage/filter facts for omitted mints, not inferred
 odds. Probability filters use 0–1; confidence is `high`, `medium` or `low`.
 
-For `lowest_risk`/`safest`, omitted filters default server-side to
+For `lowest_risk`, omitted filters default server-side to
 `min_trades_5=3`, `min_liquidity_sol=5` and `include_crashed=false`; the crash
 filter excludes both `already_crashed` and `crashed_within_24h` rows. Explicit
 values override them, including `min_trades_5=0`, `min_liquidity_sol=0` and
@@ -107,7 +106,7 @@ or spending limits. Set these in the MCP process environment:
 | `HODLODDS_MAX_PRICE_USDC` | `0.01` per call, maximum `2.5`; single-token calls retain the SDK's `1` USDC ceiling. Positive plain decimal with at most six fractional digits. |
 | `HODLODDS_SESSION_BUDGET_USDC` | Required when a key is set; positive plain decimal with at most six fractional digits. No default budget. Resets on process restart. |
 
-The default per-call cap can buy at most two delivered board rows. A larger
+The default per-call cap covers at most two delivered board rows. A larger
 offer is refused before key access with `client_refused`, which names the
 amount to set; the cap does not trim an answer down to two coins. Set `0.50` explicitly for up to 100 delivered rows, for example.
 The accepted offer amount, not the requested limit, determines the budget debit.
@@ -164,7 +163,7 @@ launched during offline package testing.
 Restart the MCP process after changing its environment. Reconcile any uncertain
 payment first: a restart also resets the session budget.
 
-## Payment safety and reconciliation
+## Payment checks and reconciliation
 
 Paid calls are serialized across tools. The SDK validates the offer's network,
 asset, pinned recipient, query binding and amount before key access or signing.
@@ -206,7 +205,7 @@ Receipts report server settlement; they are not independent proof of finality.
 
 ## Meaning and freshness
 
-0.04 means about 4 in 100 tokens like this one lose 90% or more of their price within the next 60 minutes. Higher means riskier, but a low number does not mean safe: smaller or slower drops are not counted, and the odds change minute by minute.
+0.04 means about 4 in 100 tokens like this one lose 90% or more of their price within the next 60 minutes. Higher means riskier. A low number is not a safety signal: smaller or slower drops are not counted, and the odds change minute by minute.
 
 Scores are recomputed every 60 seconds, about 20 seconds after each minute closes, from completed one-minute bars up to `as_of`. Each score covers the 60 minutes after its `as_of` time and is valid only until the next update; the odds for the same token can rise sharply from one minute to the next. Scoring starts around :20; computation and publication can delay availability. For decisions, refresh immediately before acting and once per minute for continuous monitoring, checking `as_of` for a new minute. The API freshness cutoff is separate: by default, data becomes `stale` more than 120 seconds after `issued_at` or after `expires_at`. A new request does not restart the forecast window.
 
